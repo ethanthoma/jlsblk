@@ -38,9 +38,7 @@ byte_size_to_human_readable_size :: (size: int) -> string {
         unit = it;
     }
     total := (size * 10 + divisor / 2) / divisor;
-    whole, frac := total / 10, total % 10;
-    if frac == 0 then return sprint("%%", whole, unit);
-    return sprint("%.%%", whole, frac, unit);
+    return sprint("%.%%", total / 10, total % 10, unit);
 }
 
 basename :: (path: string) -> string {
@@ -163,8 +161,8 @@ display_width :: (s: string) -> (w: int = 0) {
 }
 
 spaces :: (n: int) -> (result: string = "") {
-    for 0..n {
-        result = sprint("% ", result); 
+    for 1..n {
+        result = sprint("% ", result);
     }
     return result;
 }
@@ -229,6 +227,8 @@ build_rows :: (device: *Device, prefix: string, is_root: bool, is_last: bool, ro
 
 render :: (devices: [..]Device) {
     rows: [..]Row;
+    array_add(*rows, .{"NAME", "SIZE", "TYPE", "MOUNTPOINTS", "", false});
+
     count := devices.count;
     if count > 0 {
         for i : 0..count - 1 {
@@ -244,16 +244,23 @@ render :: (devices: [..]Device) {
     }
 
     use_color := isatty(1) != 0;
-    first := true;
+    seen_top := false;
     for * r : rows {
-        if r.top && !first then print("\n");
-        first = false;
+        if r.top {
+            if seen_top then print("\n");
+            seen_top = true;
+        }
 
         print("%", r.prefix);
         print("%", colorize(r.name, r.kind, use_color));
         print("%", spaces(name_width - display_width(r.prefix) - display_width(r.name)));
-        print(" % %", pad_left(r.size, size_width), pad_right(r.kind, kind_width));
-        if r.mounts.count > 0 then print(" %", r.mounts);
+        print(" %", pad_left(r.size, size_width));
+        if r.mounts.count > 0 {
+            print(" %", pad_right(r.kind, kind_width));
+            print(" %", r.mounts);
+        } else {
+            print(" %", r.kind);
+        }
         print("\n");
     }
 }
