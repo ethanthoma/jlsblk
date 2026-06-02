@@ -87,8 +87,19 @@
               # any cwd, and auto-supply the runtime object so plain `openjai
               # foo.jai -o foo` just works.
               makeWrapper $out/libexec/openjai $out/bin/openjai \
-                --prefix PATH : "${lib.makeBinPath [ llvm.clang llvm.lld ]}" \
-                --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath [ pkgs.libffi llvm.llvm.lib cxxlib ]}" \
+                --prefix PATH : "${
+                  lib.makeBinPath [
+                    llvm.clang
+                    llvm.lld
+                  ]
+                }" \
+                --prefix LD_LIBRARY_PATH : "${
+                  lib.makeLibraryPath [
+                    pkgs.libffi
+                    llvm.llvm.lib
+                    cxxlib
+                  ]
+                }" \
                 --append-flags "-import_dir $out/share/openjai/modules" \
                 --append-flags "--runtime $out/lib/openjai_runtime.o"
               ln -s openjai $out/bin/jai
@@ -103,9 +114,44 @@
               mainProgram = "openjai";
             };
           };
+
+          jlsblk = pkgs.stdenv.mkDerivation {
+            pname = "jlsblk";
+            version = "0.1.0";
+
+            src = lib.fileset.toSource {
+              root = ./.;
+              fileset = ./src;
+            };
+
+            nativeBuildInputs = [ openjai ];
+
+            dontConfigure = true;
+
+            buildPhase = ''
+              runHook preBuild
+              export HOME=$TMPDIR
+              openjai src/main.jai -release
+              runHook postBuild
+            '';
+
+            installPhase = ''
+              runHook preInstall
+              install -Dm755 out/a.out $out/bin/jlsblk
+              runHook postInstall
+            '';
+
+            meta = {
+              description = "lsblk clone written in Jai";
+              license = lib.licenses.mit;
+              platforms = [ "x86_64-linux" ];
+              mainProgram = "jlsblk";
+            };
+          };
         in
         {
-          packages.default = openjai;
+          packages.default = jlsblk;
+          packages.jlsblk = jlsblk;
           packages.openjai = openjai;
 
           devshells.default = {
