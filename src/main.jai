@@ -177,6 +177,8 @@ pad_left :: (s: string, width: int) -> string {
     return sprint("%%", spaces(width - display_width(s)), s);
 }
 
+isatty :: (fd: s32) -> s32 #foreign;
+
 RESET :: "\x1b[0m";
 
 color_for_kind :: (kind: string) -> string {
@@ -186,7 +188,8 @@ color_for_kind :: (kind: string) -> string {
     return "";
 }
 
-colorize :: (s: string, kind: string) -> string {
+colorize :: (s: string, kind: string, use_color: bool) -> string {
+    if !use_color then return s;
     color := color_for_kind(kind);
     if color.count == 0 then return s;
     return sprint("%%%", color, s, RESET);
@@ -240,13 +243,14 @@ render :: (devices: [..]Device) {
         kind_width = max(kind_width, display_width(r.kind));
     }
 
+    use_color := isatty(1) != 0;
     first := true;
     for * r : rows {
         if r.top && !first then print("\n");
         first = false;
 
         print("%", r.prefix);
-        print("%", colorize(r.name, r.kind));
+        print("%", colorize(r.name, r.kind, use_color));
         print("%", spaces(name_width - display_width(r.prefix) - display_width(r.name)));
         print(" % %", pad_left(r.size, size_width), pad_right(r.kind, kind_width));
         if r.mounts.count > 0 then print(" %", r.mounts);
