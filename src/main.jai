@@ -151,7 +151,15 @@ get_devices :: () -> (devices: [..]Device) {
 BOX_VERTICAL           :: "│";
 BOX_UP_AND_RIGHT       :: "└";
 BOX_VERTICAL_AND_RIGHT :: "├";
+BOX_VERTICAL_AND_LEFT  :: "┤";
 BOX_HORIZONTAL         :: "─";
+BOX_TOP_LEFT           :: "╭";
+BOX_TOP_RIGHT          :: "╮";
+BOX_BOTTOM_LEFT        :: "╰";
+BOX_BOTTOM_RIGHT       :: "╯";
+BOX_T_DOWN             :: "┬";
+BOX_T_UP               :: "┴";
+BOX_CROSS              :: "┼";
 
 display_width :: (s: string) -> (w: int = 0) {
     for i : 0..s.count - 1 {
@@ -160,24 +168,25 @@ display_width :: (s: string) -> (w: int = 0) {
     return w;
 }
 
-spaces :: (n: int) -> (result: string = "") {
+repeat :: (n: int, s := " ") -> (result: string = "") {
     for 1..n {
-        result = sprint("% ", result);
+        result = sprint("%%", result, s);
     }
     return result;
 }
 
 pad_right :: (s: string, width: int) -> string {
-    return sprint("%%", s, spaces(width - display_width(s)));
+    return sprint("%%", s, repeat(width - display_width(s)));
 }
 
 pad_left :: (s: string, width: int) -> string {
-    return sprint("%%", spaces(width - display_width(s)), s);
+    return sprint("%%", repeat(width - display_width(s)), s);
 }
 
 isatty :: (fd: s32) -> s32 #foreign;
 
 RESET :: "\x1b[0m";
+DIM   :: "\x1b[2m";
 
 color_for_kind :: (kind: string) -> string {
     if equal(kind, "disk")  then return "\x1b[1m";      // bold
@@ -191,6 +200,11 @@ colorize :: (s: string, kind: string, use_color: bool) -> string {
     color := color_for_kind(kind);
     if color.count == 0 then return s;
     return sprint("%%%", color, s, RESET);
+}
+
+dim :: (s: string, use: bool) -> string {
+    if !use then return s;
+    return sprint("%%%", DIM, s, RESET);
 }
 
 Row :: struct {
@@ -225,6 +239,46 @@ build_rows :: (device: *Device, prefix: string, is_root: bool, is_last: bool, ro
     }
 }
 
+Cols :: struct {
+    name:  int;
+    size:  int;
+    kind:  int;
+    mount: int;
+}
+
+print_rule :: (left: string, mid: string, right: string, c: Cols) {
+    print("%", left);
+    print("%", repeat(c.name + 2, BOX_HORIZONTAL));
+    print("%", mid);
+    print("%", repeat(c.size + 2, BOX_HORIZONTAL));
+    print("%", mid);
+    print("%", repeat(c.kind + 2, BOX_HORIZONTAL));
+    print("%", mid);
+    print("%", repeat(c.mount + 2, BOX_HORIZONTAL));
+    print("%\n", right);
+}
+
+print_row :: (r: *Row, c: Cols, tty: bool, header: bool) {
+    namepad := repeat(c.name - display_width(r.prefix) - display_width(r.name));
+    name := colorize(r.name, r.kind, tty);
+
+    if !tty {
+        if r.mounts.count > 0 {
+            print("%%% % % %\n", r.prefix, name, namepad, pad_left(r.size, c.size), pad_right(r.kind, c.kind), r.mounts);
+        } else {
+            print("%%% % %\n", r.prefix, name, namepad, pad_left(r.size, c.size), r.kind);
+        }
+        return;
+    }
+
+    type_cell := dim(pad_right(r.kind, c.kind), !header);
+    print("% %%% ", BOX_VERTICAL, r.prefix, name, namepad);
+    print("% % ", BOX_VERTICAL, pad_left(r.size, c.size));
+    print("% % ", BOX_VERTICAL, type_cell);
+    print("% % ", BOX_VERTICAL, pad_right(r.mounts, c.mount));
+    print("%\n", BOX_VERTICAL);
+}
+
 render :: (devices: [..]Device) {
     rows: [..]Row;
     array_add(*rows, .{"NAME", "SIZE", "TYPE", "MOUNTPOINTS", "", false});
@@ -236,33 +290,35 @@ render :: (devices: [..]Device) {
         }
     }
 
-    name_width, size_width, kind_width := 0, 0, 0;
+    name_width, size_width, kind_width, mount_width := 0, 0, 0, 0;
     for * r : rows {
         name_width = max(name_width, display_width(r.prefix) + display_width(r.name));
         size_width = max(size_width, display_width(r.size));
         kind_width = max(kind_width, display_width(r.kind));
+        mount_width = max(mount_width, display_width(r.mounts));
     }
+    c: Cols = .{name_width, size_width, kind_width, mount_width};
 
-    use_color := isatty(1) != 0;
+    tty := isatty(1) != 0;
+
+    if tty then print_rule(BOX_TOP_LEFT, BOX_T_DOWN, BOX_TOP_RIGHT, c);
+    print_row(*rows[0], c, tty, true);
+    if tty then print_rule(BOX_VERTICAL_AND_RIGHT, BOX_CROSS, BOX_VERTICAL_AND_LEFT, c);
+
     seen_top := false;
-    for * r : rows {
+    for i : 1..rows.count - 1 {
+        r := *rows[i];
         if r.top {
-            if seen_top then print("\n");
+            if seen_top {
+                if tty then print_rule(BOX_VERTICAL_AND_RIGHT, BOX_CROSS, BOX_VERTICAL_AND_LEFT, c);
+                else print("\n");
+            }
             seen_top = true;
         }
-
-        print("%", r.prefix);
-        print("%", colorize(r.name, r.kind, use_color));
-        print("%", spaces(name_width - display_width(r.prefix) - display_width(r.name)));
-        print(" %", pad_left(r.size, size_width));
-        if r.mounts.count > 0 {
-            print(" %", pad_right(r.kind, kind_width));
-            print(" %", r.mounts);
-        } else {
-            print(" %", r.kind);
-        }
-        print("\n");
+        print_row(r, c, tty, false);
     }
+
+    if tty then print_rule(BOX_BOTTOM_LEFT, BOX_T_UP, BOX_BOTTOM_RIGHT, c);
 }
 
 main :: () {
