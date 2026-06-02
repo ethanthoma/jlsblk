@@ -16,16 +16,18 @@ list_directory :: (path: string) -> (names: [..]string) {
     return names;
 }
 
-read_trimmed :: (path: string) -> (value: string, ok: bool) {
+read_trimmed :: (path: string) -> (value: string = "", ok: bool = true) {
     text, ok := read_entire_file(path);
-    if !ok then return "", false;
-    return trim(text), true;
+    if !ok then return value, ok;
+    value = trim(text);
+    return value, ok;
 }
 
-get_byte_size :: (sys_path: string) -> (byte_size: int, ok: bool = true) {
+get_byte_size :: (sys_path: string) -> (byte_size: int = 0, ok: bool = true) {
     text, ok := read_trimmed(sprint("%/size", sys_path));
-    if !ok then return 0, false;
-    return to_integer(text) * SECTOR_SIZE, true;
+    if !ok then return byte_size, ok;
+    byte_size := to_integer(text) * SECTOR_SIZE;
+    return byte_size, ok;
 }
 
 byte_size_to_human_readable_size :: (size: int) -> string {
