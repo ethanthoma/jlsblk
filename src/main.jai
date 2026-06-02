@@ -126,22 +126,110 @@ get_devices :: () -> (devices: [..]Device) {
     return devices;
 }
 
-print_device :: (device: *Device, indent: string) {
-    print("%", indent);
-    print("% % %", device.name, device.size, device.kind);
-    mounts := join(.. device.mounts, separator = ", ");
-    if mounts.count > 0 then print(" %", mounts);
-    print("\n");
-
-    child_indent := sprint("%  ", indent);
-    for device.children print_device(*it, child_indent);
-}
-
 BOX_VERTICAL           :: "│";
 BOX_UP_AND_RIGHT       :: "└";
 BOX_VERTICAL_AND_RIGHT :: "├";
 BOX_HORIZONTAL         :: "─";
 
+display_width :: (s: string) -> (w: int = 0) {
+    for i : 0..s.count - 1 {
+        if (s[i] & 0xC0) != 0x80 then w += 1;
+    }
+    return w;
+}
+
+spaces :: (n: int) -> (result: string = "") {
+    for 0..n {
+        result = sprint("% ", result); 
+    }
+    return result;
+}
+
+pad_right :: (s: string, width: int) -> string {
+    return sprint("%%", s, spaces(width - display_width(s)));
+}
+
+pad_left :: (s: string, width: int) -> string {
+    return sprint("%%", spaces(width - display_width(s)), s);
+}
+
+RESET :: "\x1b[0m";
+
+color_for_kind :: (kind: string) -> string {
+    if equal(kind, "disk")  then return "\x1b[1m";      // bold
+    if equal(kind, "crypt") then return "\x1b[1;33m";   // bold yellow
+    if equal(kind, "lvm")   then return "\x1b[1;35m";   // bold magenta
+    return "";
+}
+
+colorize :: (s: string, kind: string) -> string {
+    color := color_for_kind(kind);
+    if color.count == 0 then return s;
+    return sprint("%%%", color, s, RESET);
+}
+
+Row :: struct {
+    name:   string;
+    size:   string;
+    kind:   string;
+    mounts: string;
+    prefix: string;
+    top:    bool;
+}
+
+build_rows :: (device: *Device, prefix: string, is_root: bool, is_last: bool, rows: *[..]Row) {
+    name := device.name;
+    connector := "";
+    if !is_root {
+        connector = sprint("%%", BOX_VERTICAL_AND_RIGHT, BOX_HORIZONTAL);
+        if is_last then connector = sprint("%%", BOX_UP_AND_RIGHT, BOX_HORIZONTAL);
+    }
+    mounts := join(.. device.mounts, separator = ", ");
+    array_add(rows, .{name, device.size, device.kind, mounts, sprint("%%", prefix, connector), is_root});
+
+    child_prefix := "";
+    if !is_root {
+        continuation := sprint("%%", BOX_VERTICAL, " ");
+        if is_last then continuation = "  ";
+        child_prefix = sprint("%%", prefix, continuation);
+    }
+
+    count := device.children.count;
+    for i : 0..count - 1 {
+        build_rows(*device.children[i], child_prefix, false, i == count - 1, rows);
+    }
+}
+
+render :: (devices: [..]Device) {
+    rows: [..]Row;
+    count := devices.count;
+    if count > 0 {
+        for i : 0..count - 1 {
+            build_rows(*devices[i], "", true, i == count - 1, *rows);
+        }
+    }
+
+    name_width, size_width, kind_width := 0, 0, 0;
+    for * r : rows {
+        name_width = max(name_width, display_width(r.prefix) + display_width(r.name));
+        size_width = max(size_width, display_width(r.size));
+        kind_width = max(kind_width, display_width(r.kind));
+    }
+
+    first := true;
+    for * r : rows {
+        if r.top && !first then print("\n");
+        first = false;
+
+        print("%", r.prefix);
+        print("%", colorize(r.name, r.kind));
+        print("%", spaces(name_width - display_width(r.prefix) - display_width(r.name)));
+        print(" % %", pad_left(r.size, size_width), pad_right(r.kind, kind_width));
+        if r.mounts.count > 0 then print(" %", r.mounts);
+        print("\n");
+    }
+}
+
 main :: () {
-    for get_devices() print_device(*it, "");
+    render(get_devices());
 }

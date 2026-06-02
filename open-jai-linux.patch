@@ -30,7 +30,7 @@ index 97bddb4..2c2a7ed 100644
  }
  
 diff --git a/bootstrap/rt/core.zig b/bootstrap/rt/core.zig
-index 6aa1d36..e798a0f 100644
+index 6aa1d36..d627435 100644
 --- a/bootstrap/rt/core.zig
 +++ b/bootstrap/rt/core.zig
 @@ -1294,27 +1294,37 @@ export fn __openjai_read_entire_file(path_data: [*]const u8, path_len: usize) ?*
@@ -85,6 +85,69 @@ index 6aa1d36..e798a0f 100644
 -    header.* = .{ .len = len, .data = data };
 +    header.* = .{ .len = len, .data = @ptrCast(data_raw) };
      return header;
+ }
+ 
+@@ -2187,25 +2197,52 @@ fn rtAllocAligned(size: usize, alignment: usize) ?*anyopaque {
+     return rtAllocAlignedOwned(size, alignment, allocator_proc_default, 0, false);
+ }
+ 
+-fn rtAllocAlignedOwned(size: usize, alignment: usize, owner_proc: i64, owner_data: usize, default_alias: bool) ?*anyopaque {
+-    const requested_len = @max(size, 1);
+-    const requested_alignment = normalizeAlignment(alignment);
+-    const header_len = allocationHeaderLen();
+-    const mapped_len = header_len + requested_alignment - 1 + requested_len;
+-    const raw = oj_rt_mmap(mapped_len) orelse return null;
+-    const raw_addr = @intFromPtr(raw);
+-    const data_addr = alignForward(raw_addr + header_len, requested_alignment);
+-    const header_addr = data_addr - header_len;
++// Bump-arena in front of mmap: small allocations are carved from large mmap'd chunks instead of
++// one mmap syscall each. rtFree already keeps every mapping alive until process exit, so individual
++// blocks are never unmapped, which makes a never-freed arena the natural fit. Large requests still
++// get a dedicated mmap. Single-threaded, like the rest of this allocator.
++const arena_chunk_size: usize = 1 << 20;
++const arena_large_threshold: usize = arena_chunk_size / 4;
++var arena_offset: usize = 0;
++var arena_end: usize = 0;
++
++fn writeAllocationHeader(header_addr: usize, mapped_addr: usize, mapped_len: usize, requested_len: usize, owner_proc: i64, owner_data: usize, default_alias: bool) void {
+     const header: *RuntimeAllocationHeader = @ptrFromInt(header_addr);
+     header.* = .{
+         .magic = runtime_allocation_magic,
+-        .mapped_addr = raw_addr,
++        .mapped_addr = mapped_addr,
+         .mapped_len = mapped_len,
+         .requested_len = requested_len,
+         .owner_proc = owner_proc,
+         .owner_data = owner_data,
+         .default_alias = if (default_alias) 1 else 0,
+     };
++}
++
++fn rtAllocAlignedOwned(size: usize, alignment: usize, owner_proc: i64, owner_data: usize, default_alias: bool) ?*anyopaque {
++    const requested_len = @max(size, 1);
++    const requested_alignment = normalizeAlignment(alignment);
++    const header_len = allocationHeaderLen();
++    const block_span = header_len + requested_alignment - 1 + requested_len;
++
++    if (block_span > arena_large_threshold) {
++        const raw = oj_rt_mmap(block_span) orelse return null;
++        const raw_addr = @intFromPtr(raw);
++        const data_addr = alignForward(raw_addr + header_len, requested_alignment);
++        writeAllocationHeader(data_addr - header_len, raw_addr, block_span, requested_len, owner_proc, owner_data, default_alias);
++        return @ptrFromInt(data_addr);
++    }
++
++    if (arena_offset + block_span > arena_end) {
++        const chunk = oj_rt_mmap(arena_chunk_size) orelse return null;
++        arena_offset = @intFromPtr(chunk);
++        arena_end = arena_offset + arena_chunk_size;
++    }
++    const data_addr = alignForward(arena_offset + header_len, requested_alignment);
++    const header_addr = data_addr - header_len;
++    const block_end = data_addr + requested_len;
++    writeAllocationHeader(header_addr, header_addr, block_end - header_addr, requested_len, owner_proc, owner_data, default_alias);
++    arena_offset = alignForward(block_end, runtime_allocation_alignment);
+     return @ptrFromInt(data_addr);
  }
  
 diff --git a/bootstrap/src/Compilation.zig b/bootstrap/src/Compilation.zig
@@ -259,7 +322,7 @@ index 6b17bdb..5466a27 100644
                  break :blk switch (ast.tag(value_node)) {
                      .var_decl => if (ast.data(value_node).rhs == using_param_sentinel)
 diff --git a/bootstrap/src/bytecode_gen.zig b/bootstrap/src/bytecode_gen.zig
-index 671267a..d0fd249 100644
+index 671267a..7199ef3 100644
 --- a/bootstrap/src/bytecode_gen.zig
 +++ b/bootstrap/src/bytecode_gen.zig
 @@ -1717,7 +1717,7 @@ const GenContext = struct {
@@ -522,7 +585,20 @@ index 671267a..d0fd249 100644
                              if (spread) {
                                  const spread_src = ast.data(item_node).lhs;
                                  const spread_type = typeTextForExpr(ctx, spread_src, diag) orelse elem_ty;
-@@ -21724,6 +21893,8 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
+@@ -20821,12 +20990,6 @@ fn emitFormattedPrint(ctx: *GenContext, fmt_node: NodeIndex, arg_nodes: []const
+             start = i + 1;
+             continue;
+         }
+-        if (i + 1 < fmt.len and fmt[i + 1] == '%') {
+-            try emitLiteralPrint(program, proc, fmt[start .. i + 1], fmt_node);
+-            i += 1;
+-            start = i + 1;
+-            continue;
+-        }
+         if (start < i) try emitLiteralPrint(program, proc, fmt[start..i], fmt_node);
+         var selected_arg_index = arg_index;
+         var next_start = i + 1;
+@@ -21724,6 +21887,8 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
      var saw_spread = false;
      var values = std.ArrayList(NodeIndex).empty;
      defer values.deinit(ctx.program.allocator);
@@ -531,7 +607,7 @@ index 671267a..d0fd249 100644
  
      for (raw_args) |arg_idx| {
          const arg: NodeIndex = @intCast(arg_idx);
-@@ -21752,14 +21923,10 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
+@@ -21752,14 +21917,10 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
                  const count = payload[2];
                  for (ast.extraSlice(extra)[0..count]) |item| try values.append(ctx.program.allocator, @intCast(item));
              } else {
@@ -550,7 +626,7 @@ index 671267a..d0fd249 100644
              }
              continue;
          }
-@@ -21780,6 +21947,11 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
+@@ -21780,6 +21941,11 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
          const value = try ctx.genExpr(value_node, diag);
          try ctx.proc.instructions.append(ctx.program.allocator, .{ .opcode = .string_builder_append_string, .arg1 = builder_slot, .arg2 = value, .source_node = value_node });
      }
