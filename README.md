@@ -7,13 +7,7 @@
 
 ## Run
 
-With the nix flake dev shell active, run the `run` script with
-
-```bash
-./run
-```
-
-or using nix directly:
+Run it from GitHub using Nix:
 
 ```bash
 # https
@@ -21,6 +15,29 @@ nix run github:ethanthoma/jlsblk
 
 # ssh
 nix run git+ssh://git@github.com/ethanthoma/jlsblk.git
+```
+
+Or clone and run it locally using the Nix flake's dev shell:
+
+```bash
+# run with nix
+nix run
+
+# run using the bash script
+nix develop
+./run
+```
+
+## Install
+
+NixOS config:
+
+```nix
+  {
+    inputs.jlsblk.url = "github:ethanthoma/jlsblk";
+
+    environment.systemPackages = [ inputs.jlsblk.packages.${pkgs.system}.default ];
+  }
 ```
 
 ## Links
