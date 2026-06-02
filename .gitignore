@@ -1,0 +1,14 @@
+*
+!*/
+
+!.gitignore
+
+!flake.nix
+!flake.lock
+
+!run
+
+!src/**/*.jai
+
+# tmp while using open-jai
+!open-jai-linux.patch

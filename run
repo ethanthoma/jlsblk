@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+
+jai src/main.jai -exe out/jlsblk && ./out/jlsblk

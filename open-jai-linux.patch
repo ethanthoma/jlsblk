@@ -1,0 +1,308 @@
+diff --git a/bootstrap/build.zig b/bootstrap/build.zig
+index 97bddb4..2c2a7ed 100644
+--- a/bootstrap/build.zig
++++ b/bootstrap/build.zig
+@@ -47,14 +47,14 @@ pub fn build(b: *std.Build) void {
+     addCxxRuntimeLinkArgs(link_exe, target);
+     link_exe.addArg("-lffi");
+     link_exe.addArg("-o");
+-    const linked_exe = link_exe.addOutputFileArg("openjai-macos");
++    const linked_exe = link_exe.addOutputFileArg("openjai");
+     const llvm_libdir = std.mem.trim(
+         u8,
+         b.run(&.{ llvm_config, "--libdir" }),
+         " \t\r\n",
+     );
+     link_exe.addArg(b.fmt("-Wl,-rpath,{s}", .{llvm_libdir}));
+-    const install_exe = b.addInstallBinFile(linked_exe, "openjai-macos");
++    const install_exe = b.addInstallBinFile(linked_exe, "openjai");
+     b.getInstallStep().dependOn(&install_exe.step);
+ 
+     const runtime_mod = createRuntimeModule(b, target, optimize, "rt/runtime.zig");
+@@ -190,6 +190,9 @@ fn configureLlvmImports(b: *std.Build, mod: *std.Build.Module, llvm_config: []co
+         b.run(&.{ llvm_config, "--includedir" }),
+         " \t\r\n",
+     )) });
++    if (b.graph.environ_map.get("OPENJAI_FFI_INCLUDE")) |ffi_include| {
++        mod.addIncludePath(.{ .cwd_relative = ffi_include });
++    }
+     mod.link_libc = true;
+ }
+ 
+diff --git a/bootstrap/rt/core.zig b/bootstrap/rt/core.zig
+index 6aa1d36..e798a0f 100644
+--- a/bootstrap/rt/core.zig
++++ b/bootstrap/rt/core.zig
+@@ -1294,27 +1294,37 @@ export fn __openjai_read_entire_file(path_data: [*]const u8, path_len: usize) ?*
+     if (fd < 0) return null;
+     defer _ = oj_rt_close(fd);
+ 
+-    var stat: OpenJaiRtStat = undefined;
+-    if (oj_rt_stat(path_z, &stat) != 0 or stat.size < 0) return null;
+-    const len: usize = @intCast(stat.size);
+-    const header_raw = rtAlloc(@sizeOf(OpenJaiRuntimeString)) orelse return null;
+-    const data_raw = rtAlloc(@max(len, 1)) orelse {
+-        rtFree(header_raw);
+-        return null;
+-    };
+-    const data: [*]u8 = @ptrCast(data_raw);
+-    var offset: usize = 0;
+-    while (offset < len) {
+-        const read_count = oj_rt_read(fd, data + offset, len - offset);
+-        if (read_count <= 0) {
++    // Loop until EOF instead of trusting stat() size, so 0-size virtual files
++    // (procfs/sysfs) read correctly rather than coming back empty.
++    var cap: usize = 4096;
++    var data_raw = rtAlloc(cap) orelse return null;
++    var len: usize = 0;
++    while (true) {
++        if (len == cap) {
++            const new_cap = cap * 2;
++            const grown = rtRealloc(data_raw, cap, new_cap) orelse {
++                rtFree(data_raw);
++                return null;
++            };
++            data_raw = grown;
++            cap = new_cap;
++        }
++        const data: [*]u8 = @ptrCast(data_raw);
++        const read_count = oj_rt_read(fd, data + len, cap - len);
++        if (read_count < 0) {
+             rtFree(data_raw);
+-            rtFree(header_raw);
+             return null;
+         }
+-        offset += @intCast(read_count);
++        if (read_count == 0) break;
++        len += @intCast(read_count);
+     }
++
++    const header_raw = rtAlloc(@sizeOf(OpenJaiRuntimeString)) orelse {
++        rtFree(data_raw);
++        return null;
++    };
+     const header: *OpenJaiRuntimeString = @ptrCast(@alignCast(header_raw));
+-    header.* = .{ .len = len, .data = data };
++    header.* = .{ .len = len, .data = @ptrCast(data_raw) };
+     return header;
+ }
+ 
+diff --git a/bootstrap/src/Compilation.zig b/bootstrap/src/Compilation.zig
+index 9bbe4e3..985aa6c 100644
+--- a/bootstrap/src/Compilation.zig
++++ b/bootstrap/src/Compilation.zig
+@@ -934,6 +934,7 @@ pub const Compilation = struct {
+             block_vm.current_workspace_build_strings = &comp.pending_current_workspace_sources;
+             block_vm.next_workspace_id = &comp.next_workspace_id;
+             block_vm.command_line = comp.options.command_line;
++            block_vm.import_dirs = comp.options.import_dirs;
+             defer block_vm.deinit();
+             const result = try comp.translateRunResultProc(ast, &block_program, try comp.ownRunResult(try block_vm.runProc(block_program.main_proc.?, diag)), diag, ast.tokens[ast.mainToken(expr)].start);
+             try comp.captureVMWorkspaceState(&block_vm);
+@@ -1053,6 +1054,7 @@ pub const Compilation = struct {
+         vm.current_workspace_build_strings = &comp.pending_current_workspace_sources;
+         vm.next_workspace_id = &comp.next_workspace_id;
+         vm.command_line = comp.options.command_line;
++        vm.import_dirs = comp.options.import_dirs;
+         defer vm.deinit();
+         const expected_type_id: ?u32 = if (typed.typeOf(run_node).isAny() or typed.typeOf(expr).isAny()) 16 else null;
+         const result = try comp.translateRunResultProc(ast, &run_program, try comp.ownRunResult(try vm.runProcWithArgsExpectedType(run_program.main_proc.?, arg_values.items, expected_type_id, diag)), diag, ast.tokens[ast.mainToken(expr)].start);
+@@ -1067,6 +1069,7 @@ pub const Compilation = struct {
+         vm.current_workspace_build_strings = &comp.pending_current_workspace_sources;
+         vm.next_workspace_id = &comp.next_workspace_id;
+         vm.command_line = comp.options.command_line;
++        vm.import_dirs = comp.options.import_dirs;
+         defer vm.deinit();
+         const expected_type_id: ?u32 = if (typed.typeOf(expr).isAny()) 16 else null;
+         const result = try comp.translateRunResultProc(ast, &run_program, try comp.ownRunResult(try vm.runProcExpectedType(run_program.main_proc.?, expected_type_id, diag)), diag, ast.tokens[ast.mainToken(expr)].start);
+diff --git a/bootstrap/src/bytecode_gen.zig b/bootstrap/src/bytecode_gen.zig
+index 671267a..5d3cfdd 100644
+--- a/bootstrap/src/bytecode_gen.zig
++++ b/bootstrap/src/bytecode_gen.zig
+@@ -6996,9 +6996,33 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+                         const lhs = ast.data(child).lhs;
+                         const decl = ctx.resolved.local_values.get(lhs) orelse return diag.failAt(ast.tokens[ast.mainToken(lhs)].start, "assignment target must resolve to a local variable", .{});
+                         try lhs_decls.append(ctx.program.allocator, decl);
+-                        try rhs_regs.append(ctx.program.allocator, try ctx.genExpr(ast.data(child).rhs, diag));
++                        // Copy each RHS into a fresh temp so a target appearing in a
++                        // later RHS (e.g. `a, b = b, a`) reads the old value, not the
++                        // just-stored one — preserving parallel-assignment semantics.
++                        const rhs_value = try ctx.genExpr(ast.data(child).rhs, diag);
++                        const tmp = ctx.proc.num_registers;
++                        ctx.proc.num_registers += 1;
++                        try ctx.proc.instructions.append(ctx.program.allocator, .{ .opcode = .load, .dest = tmp, .arg1 = rhs_value, .source_node = stmt });
++                        try rhs_regs.append(ctx.program.allocator, tmp);
++                    }
++                    // RHS values are already in temp registers (parallel semantics);
++                    // now emit real stores so strings and loop-carried locals persist,
++                    // mirroring the single-assignment local store path.
++                    for (lhs_decls.items, rhs_regs.items) |decl, reg| {
++                        if (ctx.decl_registers.get(decl)) |old_reg| {
++                            if (ctx.string_materialized.contains(decl)) {
++                                try ctx.storeStringIntoMaterializedLocal(old_reg, reg, stmt);
++                            } else {
++                                if (ctx.decl_addresses.get(decl)) |addr| {
++                                    const type_text = typeTextForDecl(ctx, decl, diag) orelse "int";
++                                    try emitStoreToAddressForType(ctx, addr, reg, type_text, stmt, diag);
++                                }
++                                try ctx.proc.instructions.append(ctx.program.allocator, .{ .opcode = .load, .dest = old_reg, .arg1 = reg, .source_node = stmt });
++                            }
++                        } else {
++                            try ctx.decl_registers.put(ctx.program.allocator, decl, reg);
++                        }
+                     }
+-                    for (lhs_decls.items, rhs_regs.items) |decl, reg| try ctx.decl_registers.put(ctx.program.allocator, decl, reg);
+                 } else {
+                     for (ast.extraSlice(ast.data(stmt).lhs)) |child| try ctx.genStmt(@intCast(child), diag);
+                 }
+@@ -7105,11 +7129,16 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+                         try ctx.proc.instructions.append(ctx.program.allocator, .{ .opcode = .store_ptr_byte, .dest = addr, .arg1 = rhs, .source_node = stmt });
+                     } else {
+                         const target_elem_type = elem_text orelse "int";
+-                        const store_value = if (std.mem.eql(u8, firstTypeWord(target_elem_type), "Any"))
+-                            try emitAnyBox(ctx, rhs_node, rhs, stmt, diag)
+-                        else
+-                            rhs;
+-                        try emitStoreToAddressForType(ctx, addr, store_value, target_elem_type, stmt, diag);
++                        if (std.mem.eql(u8, firstTypeWord(target_elem_type), "Any")) {
++                            const any_reg = try emitAnyBox(ctx, rhs_node, rhs, stmt, diag);
++                            try emitStoreToAddressForType(ctx, addr, any_reg, target_elem_type, stmt, diag);
++                        } else if (try typeTextIsEmbeddedStruct(ctx, target_elem_type, diag)) {
++                            // struct elements must be copied whole, not stored as a scalar
++                            const size_reg = try ctx.emitInt(stmt, @intCast(try typeTextSize(ctx, target_elem_type, diag)));
++                            try ctx.proc.instructions.append(ctx.program.allocator, .{ .opcode = .memcpy, .dest = addr, .arg1 = rhs, .arg2 = size_reg, .source_node = stmt });
++                        } else {
++                            try emitStoreToAddressForType(ctx, addr, rhs, target_elem_type, stmt, diag);
++                        }
+                     }
+                     return;
+                 }
+@@ -7256,6 +7285,27 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+                         }
+                     }
+                     const reg = try ctx.genExpr(init, diag);
++                    // A struct local initialized from an existing *lvalue* (e.g. `tmp := a[i]`,
++                    // `b := s.field`, `b := other`) must own a copy, not alias the source.
++                    // Restrict to lvalues: a call result is already a fresh value, and copying
++                    // it would also try to materialize special VM structs (Build_Options) as
++                    // raw bytes, which is unsupported.
++                    const init_is_lvalue = ast.tag(init) == .index_expr or ast.tag(init) == .field_access or ast.tag(init) == .identifier;
++                    if (ast.tag(stmt) == .var_decl and init_is_lvalue) {
++                        if (typeTextForExpr(ctx, init, diag)) |init_struct_text| {
++                            const clean_struct = std.mem.trim(u8, init_struct_text, " \t\r\n");
++                            if (try typeTextIsEmbeddedStruct(ctx, clean_struct, diag)) {
++                                const struct_size = try typeTextSize(ctx, clean_struct, diag);
++                                const copy_slot = ctx.proc.num_registers;
++                                ctx.proc.num_registers += 1;
++                                try ctx.proc.instructions.append(ctx.program.allocator, .{ .opcode = .alloc_local_bytes, .dest = copy_slot, .arg1 = @intCast(@max(struct_size, 1)), .source_node = stmt });
++                                const copy_size_reg = try ctx.emitInt(stmt, @intCast(@max(struct_size, 1)));
++                                try ctx.proc.instructions.append(ctx.program.allocator, .{ .opcode = .memcpy, .dest = copy_slot, .arg1 = reg, .arg2 = copy_size_reg, .source_node = stmt });
++                                try ctx.decl_registers.put(ctx.program.allocator, stmt, copy_slot);
++                                return;
++                            }
++                        }
++                    }
+                     const ty = if (ctx.typed) |typed| typed.typeOf(stmt) else Type.init(InternPool.well_known.any_type);
+                     const init_ty = if (ctx.typed) |typed| typed.typeOf(init) else Type.init(InternPool.well_known.any_type);
+                     if (ast.tag(stmt) == .var_decl) {
+@@ -11699,7 +11749,15 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+                         for (args[1..]) |item_idx| {
+                             const item_node: NodeIndex = @intCast(item_idx);
+                             const spread = ast.tag(item_node) == .unary_expr and ast.tokens[ast.mainToken(item_node)].tag == .dot_dot;
+-                            const item_reg = try ctx.genExpr(if (spread) ast.data(item_node).lhs else item_node, diag);
++                            const item_is_aggregate = !spread and elem_is_struct and (ast.tag(item_node) == .aggregate_literal or ast.tag(item_node) == .typed_aggregate_literal);
++                            const item_reg = if (item_is_aggregate) blk_item: {
++                                // genExpr doesn't materialize an aggregate literal in value
++                                // position (only var-decl/return/call contexts do), so build
++                                // it into an addressable slot before array_add copies from it.
++                                const slot = try ctx.genDefaultValueFromText(elem_ty, expr, diag);
++                                try ctx.emitAggregateToStruct(item_node, slot, elem_ty, expr, diag);
++                                break :blk_item slot;
++                            } else try ctx.genExpr(if (spread) ast.data(item_node).lhs else item_node, diag);
+                             if (spread) {
+                                 const spread_src = ast.data(item_node).lhs;
+                                 const spread_type = typeTextForExpr(ctx, spread_src, diag) orelse elem_ty;
+@@ -21724,6 +21782,8 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
+     var saw_spread = false;
+     var values = std.ArrayList(NodeIndex).empty;
+     defer values.deinit(ctx.program.allocator);
++    var dyn_arrays = std.ArrayList(NodeIndex).empty;
++    defer dyn_arrays.deinit(ctx.program.allocator);
+ 
+     for (raw_args) |arg_idx| {
+         const arg: NodeIndex = @intCast(arg_idx);
+@@ -21752,14 +21812,10 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
+                 const count = payload[2];
+                 for (ast.extraSlice(extra)[0..count]) |item| try values.append(ctx.program.allocator, @intCast(item));
+             } else {
+-                const arr_reg = try ctx.genExpr(operand, diag);
+-                const sep_reg_val: Bytecode.Register = if (separator_node != @import("Ast.zig").null_node)
+-                    try ctx.genExpr(separator_node, diag)
+-                else
+-                    try ctx.emitString(source_node, "");
+-                const flags: u32 = @as(u32, if (before_first) 1 else 0) | @as(u32, if (after_last) 2 else 0);
+-                try ctx.proc.instructions.append(ctx.program.allocator, .{ .opcode = .string_builder_join_array, .arg1 = builder_slot, .arg2 = arr_reg, .arg3 = sep_reg_val, .arg4 = flags, .source_node = source_node });
+-                continue;
++                // Defer dynamic-array spreads to the post-loop pass so a
++                // `separator = ...` appearing AFTER the spread is picked up
++                // (reading it inline here loses it, since it's not seen yet).
++                try dyn_arrays.append(ctx.program.allocator, operand);
+             }
+             continue;
+         }
+@@ -21780,6 +21836,11 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
+         const value = try ctx.genExpr(value_node, diag);
+         try ctx.proc.instructions.append(ctx.program.allocator, .{ .opcode = .string_builder_append_string, .arg1 = builder_slot, .arg2 = value, .source_node = value_node });
+     }
++    for (dyn_arrays.items) |operand| {
++        const arr_reg = try ctx.genExpr(operand, diag);
++        const sep_for_join = sep_reg orelse try ctx.emitString(source_node, "");
++        try ctx.proc.instructions.append(ctx.program.allocator, .{ .opcode = .string_builder_join_array, .arg1 = builder_slot, .arg2 = arr_reg, .arg3 = sep_for_join, .arg4 = 0, .source_node = source_node });
++    }
+     if (after_last) {
+         if (sep_reg) |reg| try ctx.proc.instructions.append(ctx.program.allocator, .{ .opcode = .string_builder_append_string, .arg1 = builder_slot, .arg2 = reg, .source_node = source_node });
+     }
+diff --git a/bootstrap/src/link.zig b/bootstrap/src/link.zig
+index ae78b38..fec4f37 100644
+--- a/bootstrap/src/link.zig
++++ b/bootstrap/src/link.zig
+@@ -17,7 +17,7 @@ pub fn link(allocator: std.mem.Allocator, io: std.Io, object_path: []const u8, r
+         try argv.appendSlice(allocator, &.{ "-Wl,-rpath,/usr/local/llvm/lib" });
+         if (sdk_path) |path| try argv.appendSlice(allocator, &.{ "-isysroot", path });
+     } else {
+-        try argv.appendSlice(allocator, &.{ "cc", "-o", output_path, object_path });
++        try argv.appendSlice(allocator, &.{ "cc", "-no-pie", "-o", output_path, object_path });
+     }
+     try argv.appendSlice(allocator, runtime_inputs.items.items);
+ 
+diff --git a/bootstrap/src/vm.zig b/bootstrap/src/vm.zig
+index 18523ab..d3dd687 100644
+--- a/bootstrap/src/vm.zig
++++ b/bootstrap/src/vm.zig
+@@ -9,7 +9,7 @@ const time_c = @cImport({
+ });
+ 
+ const foreign_c = @cImport({
+-    @cInclude("ffi/ffi.h");
++    @cInclude("ffi.h");
+     @cInclude("dlfcn.h");
+ });
+ 
+@@ -311,6 +311,7 @@ pub const VM = struct {
+     io: ?std.Io = null,
+     base_dir: []const u8 = ".",
+     command_line: []const []const u8 = &.{},
++    import_dirs: []const []const u8 = &.{},
+     current_workspace_build_strings: ?*std.ArrayList([]const u8) = null,
+     next_workspace_id: ?*i64 = null,
+     current_workspace_id: i64 = 2,
+@@ -3871,6 +3872,9 @@ pub const VM = struct {
+         const header = try vm.newDynamicArray(0, 16, diag);
+         const array_index = vm.dynamicArrayIndexForPointer(header) orelse return diag.failAt(0, "Build_Options.import_path allocation failed", .{});
+         _ = try vm.dynamicArrayAdd(header, .{ .string = "modules" }, 16, diag);
++        // Workspaces inherit the compiler's -import_dir paths (e.g. the bundled
++        // standard modules), so a build metaprogram can find "Basic" etc.
++        for (vm.import_dirs) |dir| _ = try vm.dynamicArrayAdd(header, .{ .string = dir }, 16, diag);
+         options.import_path = array_index;
+         return header;
+     }
