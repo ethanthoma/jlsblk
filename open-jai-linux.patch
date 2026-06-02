@@ -115,11 +115,311 @@ index 9bbe4e3..985aa6c 100644
          defer vm.deinit();
          const expected_type_id: ?u32 = if (typed.typeOf(expr).isAny()) 16 else null;
          const result = try comp.translateRunResultProc(ast, &run_program, try comp.ownRunResult(try vm.runProcExpectedType(run_program.main_proc.?, expected_type_id, diag)), diag, ast.tokens[ast.mainToken(expr)].start);
+diff --git a/bootstrap/src/Sema.zig b/bootstrap/src/Sema.zig
+index 6b17bdb..5466a27 100644
+--- a/bootstrap/src/Sema.zig
++++ b/bootstrap/src/Sema.zig
+@@ -49,8 +49,11 @@ pub const Typed = struct {
+     comptime_messages: std.AutoHashMapUnmanaged(NodeIndex, MessageValue) = .empty,
+     owned_message_strings: std.ArrayList([]const u8) = .empty,
+     comptime_procs: std.AutoHashMapUnmanaged(NodeIndex, NodeIndex) = .empty,
++    destructure_targets: std.AutoHashMapUnmanaged(NodeIndex, DestructureTarget) = .empty,
+     main_proc: ?NodeIndex,
+ 
++    pub const DestructureTarget = struct { call: NodeIndex, index: u32 };
++
+     pub fn deinit(t: *Typed) void {
+         t.type_aliases.deinit(t.allocator);
+         t.struct_type_aliases.deinit(t.allocator);
+@@ -89,6 +92,7 @@ pub const Typed = struct {
+         for (t.owned_message_strings.items) |value| t.allocator.free(value);
+         t.owned_message_strings.deinit(t.allocator);
+         t.comptime_procs.deinit(t.allocator);
++        t.destructure_targets.deinit(t.allocator);
+         t.allocator.free(t.node_types);
+     }
+ 
+@@ -316,6 +320,7 @@ pub fn analyze(allocator: std.mem.Allocator, ast: *const Ast, resolved: *const R
+     };
+     errdefer typed.deinit();
+     @memset(typed.node_types, Type.voidType());
++    try collectDestructureTargets(ast, &typed);
+     try collectTypeAliases(ast, &typed, ast.data(ast.root).lhs, diag);
+     const root_decls = ast.extraSlice(ast.data(ast.root).lhs);
+     var main_count: usize = 0;
+@@ -339,6 +344,98 @@ pub fn analyze(allocator: std.mem.Allocator, ast: *const Ast, resolved: *const R
+     return typed;
+ }
+ 
++fn stmtSharedCallRhs(ast: *const Ast, stmt: NodeIndex) ?NodeIndex {
++    const rhs = switch (ast.tag(stmt)) {
++        .var_decl => ast.data(stmt).rhs,
++        .assign_stmt => ast.data(stmt).rhs,
++        else => return null,
++    };
++    if (rhs == @import("Ast.zig").null_node) return null;
++    return rhs;
++}
++
++fn collectDestructureTargets(ast: *const Ast, typed: *Typed) !void {
++    for (0..ast.node_tags.items.len) |idx| {
++        const node: NodeIndex = @intCast(idx);
++        if (ast.tag(node) != .stmt_list) continue;
++        const children = ast.extraSlice(ast.data(node).lhs);
++        if (children.len < 2) continue;
++        var shared_rhs: NodeIndex = @import("Ast.zig").null_node;
++        var matches = true;
++        for (children) |child_idx| {
++            const rhs = stmtSharedCallRhs(ast, @intCast(child_idx)) orelse {
++                matches = false;
++                break;
++            };
++            if (shared_rhs == @import("Ast.zig").null_node) shared_rhs = rhs else if (rhs != shared_rhs) {
++                matches = false;
++                break;
++            }
++        }
++        if (!matches or shared_rhs == @import("Ast.zig").null_node or ast.tag(shared_rhs) != .call_expr) continue;
++        for (children, 0..) |child_idx, i| {
++            const child: NodeIndex = @intCast(child_idx);
++            if (ast.tag(child) != .var_decl) continue;
++            try typed.destructure_targets.put(typed.allocator, child, .{ .call = shared_rhs, .index = @intCast(i) });
++        }
++    }
++}
++
++fn firstReturnStmt(ast: *const Ast, node: NodeIndex) ?NodeIndex {
++    if (node == @import("Ast.zig").null_node or node >= ast.node_tags.items.len) return null;
++    switch (ast.tag(node)) {
++        .return_stmt => return node,
++        .block, .stmt_list => {
++            for (ast.extraSlice(ast.data(node).lhs)) |child| {
++                if (firstReturnStmt(ast, @intCast(child))) |ret| return ret;
++            }
++            return null;
++        },
++        .if_stmt => {
++            const data = ast.data(node);
++            if (firstReturnStmt(ast, data.lhs)) |ret| return ret;
++            if (data.rhs < ast.extra_data.items.len) {
++                for (ast.extraSlice(data.rhs)) |child| {
++                    if (firstReturnStmt(ast, @intCast(child))) |ret| return ret;
++                }
++            }
++            return null;
++        },
++        .while_stmt, .for_stmt, .defer_stmt, .expr_stmt => {
++            const data = ast.data(node);
++            return firstReturnStmt(ast, data.lhs) orelse firstReturnStmt(ast, data.rhs);
++        },
++        else => return null,
++    }
++}
++
++fn callTargetProc(ast: *const Ast, resolved: *const Resolved, callee: NodeIndex) ?NodeIndex {
++    if (ast.tag(callee) == .proc_decl) return callee;
++    if (ast.tag(callee) != .identifier) return null;
++    if (resolved.local_values.get(callee)) |decl| {
++        if (isValidNode(ast, decl) and ast.tag(decl) == .proc_decl) return decl;
++        if (isValidNode(ast, decl) and ast.tag(decl) == .var_decl and isValidNode(ast, ast.data(decl).rhs) and ast.tag(ast.data(decl).rhs) == .proc_decl) return ast.data(decl).rhs;
++    }
++    const name = ast.tokenSlice(ast.mainToken(callee));
++    if (resolved.lookup(name)) |sym| switch (sym) {
++        .proc => |proc_node| return proc_node,
++        .const_value => |value_node| if (isValidNode(ast, value_node) and ast.tag(value_node) == .proc_decl) return value_node,
++        else => {},
++    };
++    return null;
++}
++
++fn nthReturnType(ast: *const Ast, resolved: *const Resolved, typed: *Typed, call: NodeIndex, index: u32, diag: Diagnostic) anyerror!?Type {
++    if (call == @import("Ast.zig").null_node or call >= ast.node_tags.items.len or ast.tag(call) != .call_expr) return null;
++    const proc = callTargetProc(ast, resolved, ast.data(call).lhs) orelse return null;
++    const return_stmt = firstReturnStmt(ast, ast.data(proc).lhs) orelse return null;
++    const value = ast.data(return_stmt).lhs;
++    if (value == @import("Ast.zig").null_node or value >= ast.node_tags.items.len or ast.tag(value) != .stmt_list) return null;
++    const returns = ast.extraSlice(ast.data(value).lhs);
++    if (index >= returns.len) return null;
++    return try analyzeNode(ast, resolved, typed, @intCast(returns[index]), diag);
++}
++
+ fn analyzeProc(ast: *const Ast, resolved: *const Resolved, typed: *Typed, proc: NodeIndex, diag: Diagnostic) !void {
+     const body = ast.data(proc).lhs;
+     if (body != @import("Ast.zig").null_node) try analyzeBlock(ast, resolved, typed, body, diag);
+@@ -639,6 +736,11 @@ fn analyzeNode(ast: *const Ast, resolved: *const Resolved, typed: *Typed, node:
+                     }
+                     break :blk loop_ty;
+                 }
++                if (ast.tag(value_node) == .var_decl and ast.data(value_node).lhs == @import("Ast.zig").null_node) {
++                    if (typed.destructure_targets.get(value_node)) |target| {
++                        if (try nthReturnType(ast, resolved, typed, target.call, target.index, diag)) |ret_ty| break :blk ret_ty;
++                    }
++                }
+                 if (try procedureOfCallValueType(ast, resolved, typed, value_node, diag)) |proc_ty| break :blk proc_ty;
+                 break :blk switch (ast.tag(value_node)) {
+                     .var_decl => if (ast.data(value_node).rhs == using_param_sentinel)
 diff --git a/bootstrap/src/bytecode_gen.zig b/bootstrap/src/bytecode_gen.zig
-index 671267a..5d3cfdd 100644
+index 671267a..d0fd249 100644
 --- a/bootstrap/src/bytecode_gen.zig
 +++ b/bootstrap/src/bytecode_gen.zig
-@@ -6996,9 +6996,33 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+@@ -1717,7 +1717,7 @@ const GenContext = struct {
+             try typeIdFromTypeExpr(ast, sig.return_type, diag)
+         else
+             0;
+-        if (!typeIdCanUseDirectCall(return_type) and !typeNodeCanUseDirectCall(ast, sig.return_type)) return null;
++        if (!typeIdCanUseDirectCall(return_type) and !typeNodeCanUseDirectCall(ast, sig.return_type) and !ctx.plainStructCanUseDirectCall(sig.return_type)) return null;
+         for (params) |param_idx| {
+             const param: NodeIndex = @intCast(param_idx);
+             const param_type = ast.data(param).lhs;
+@@ -1728,7 +1728,7 @@ const GenContext = struct {
+                 try typeIdFromTypeExpr(ast, param_type, diag)
+             else
+                 16;
+-            if (!typeIdCanUseDirectCall(param_type_id) and !typeNodeCanUseDirectCall(ast, param_type) and !isCallerLocationExpr(ast, ast.data(param).rhs)) return null;
++            if (!typeIdCanUseDirectCall(param_type_id) and !typeNodeCanUseDirectCall(ast, param_type) and !ctx.plainStructCanUseDirectCall(param_type) and !isCallerLocationExpr(ast, ast.data(param).rhs)) return null;
+         }
+         const dest: Bytecode.Register = if (return_type == 0) 0 else blk: {
+             const reg = ctx.proc.num_registers;
+@@ -2206,6 +2206,22 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+         return typeTextCanUseDirectCall(nodeSourceText(ast, type_node));
+     }
+ 
++    // A plain by-value struct (not a pointer, view, dynamic array, or polymorphic/parameterized
++    // type) can cross a real call boundary: the LLVM backend passes it as an aggregate argument and
++    // returns it as an aggregate struct. Enabling this lets struct-returning/struct-taking procs
++    // recurse (which inlining cannot do at arbitrary depth).
++    fn plainStructCanUseDirectCall(ctx: *GenContext, type_node: NodeIndex) bool {
++        if (type_node == @import("Ast.zig").null_node or type_node >= ctx.ast.node_tags.items.len) return false;
++        const text = std.mem.trim(u8, nodeSourceText(ctx.ast, type_node), " \t\r\n");
++        if (text.len == 0) return false;
++        if (text[0] == '*' or text[0] == '[' or text[0] == '$') return false;
++        if (std.mem.indexOfScalar(u8, text, '(') != null) return false;
++        if (std.mem.indexOf(u8, text, "->") != null) return false;
++        const node = (structTypeNodeByName(ctx, firstTypeWord(text)) catch return false) orelse return false;
++        if (containerTypeParameterText(ctx.ast, node) != null) return false;
++        return true;
++    }
++
+     fn procIndexForNode(ctx: *GenContext, proc_node: NodeIndex) ?u32 {
+         if (proc_node == ctx.current_proc_node and
+             ctx.current_proc_index < ctx.program.proc_nodes.items.len and
+@@ -3569,6 +3585,10 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+             frame.named_return_decls = named_ret_buf[0..named_ret_count];
+         }
+ 
++        var decl_snapshot = BodyDeclSnapshot{};
++        defer decl_snapshot.deinit(allocator);
++        for (stmts) |stmt_idx| ctx.snapshotBodyDeclState(@intCast(stmt_idx), &decl_snapshot);
++
+         for (stmts) |stmt_idx| {
+             ctx.syncNumRegistersWithBindings();
+             try ctx.genStmt(@intCast(stmt_idx), diag);
+@@ -3576,6 +3596,7 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+         const end_index: u32 = @intCast(ctx.proc.instructions.items.len);
+         for (frame.patches.items) |patch| ctx.proc.instructions.items[patch].arg1 = end_index;
+         for (stmts) |stmt_idx| ctx.removeBodyDeclState(@intCast(stmt_idx));
++        ctx.restoreBodyDeclState(&decl_snapshot);
+         if (sig.return_type != @import("Ast.zig").null_node) {
+             var ret_text = ctx.nodeSource(sig.return_type);
+             if (ctx.polymorph_types.get(ret_text)) |actual| ret_text = actual;
+@@ -6093,6 +6114,96 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+         }
+     }
+ 
++    const BodyDeclSnapshot = struct {
++        const NodeReg = struct { node: NodeIndex, reg: Bytecode.Register };
++        const RegPair = struct { key: Bytecode.Register, val: Bytecode.Register };
++        const NodeText = struct { node: NodeIndex, text: []const u8 };
++        const NameNode = struct { name: []const u8, node: NodeIndex };
++        regs: std.ArrayList(NodeReg) = .empty,
++        addrs: std.ArrayList(NodeReg) = .empty,
++        ptr_addrs: std.ArrayList(RegPair) = .empty,
++        strings: std.ArrayList(NodeReg) = .empty,
++        type_ovr: std.ArrayList(NodeText) = .empty,
++        type_val_ovr: std.ArrayList(NodeText) = .empty,
++        local_vals: std.ArrayList(NameNode) = .empty,
++
++        fn deinit(self: *BodyDeclSnapshot, allocator: std.mem.Allocator) void {
++            self.regs.deinit(allocator);
++            self.addrs.deinit(allocator);
++            self.ptr_addrs.deinit(allocator);
++            self.strings.deinit(allocator);
++            self.type_ovr.deinit(allocator);
++            self.type_val_ovr.deinit(allocator);
++            self.local_vals.deinit(allocator);
++        }
++    };
++
++    // Inlining reuses the caller's AST nodes as the inlinee's locals. For a self-recursive
++    // inline, generating the body rebinds those shared nodes and removeBodyDeclState then wipes
++    // the caller's bindings entirely. Snapshot the caller's bindings first, then re-apply them
++    // after removal so values live across the inlined call keep resolving to the caller's registers.
++    fn snapshotBodyDeclState(ctx: *GenContext, node: NodeIndex, snap: *BodyDeclSnapshot) void {
++        var visited: std.AutoHashMapUnmanaged(NodeIndex, void) = .empty;
++        defer visited.deinit(ctx.program.allocator);
++        ctx.snapshotBodyDeclStateInner(node, snap, &visited);
++    }
++
++    fn snapshotBodyDeclStateInner(ctx: *GenContext, node: NodeIndex, snap: *BodyDeclSnapshot, visited: *std.AutoHashMapUnmanaged(NodeIndex, void)) void {
++        const allocator = ctx.program.allocator;
++        if (node == @import("Ast.zig").null_node or node >= ctx.ast.node_tags.items.len) return;
++        if (visited.contains(node)) return;
++        visited.put(allocator, node, {}) catch return;
++        if (ctx.type_overrides.get(node)) |t| snap.type_ovr.append(allocator, .{ .node = node, .text = t }) catch {};
++        if (ctx.type_value_overrides.get(node)) |t| snap.type_val_ovr.append(allocator, .{ .node = node, .text = t }) catch {};
++        switch (ctx.ast.tag(node)) {
++            .var_decl, .const_decl => {
++                if (ctx.decl_addresses.get(node)) |reg| {
++                    snap.addrs.append(allocator, .{ .node = node, .reg = reg }) catch {};
++                    if (ctx.pointer_addrs.get(reg)) |p| snap.ptr_addrs.append(allocator, .{ .key = reg, .val = p }) catch {};
++                }
++                if (ctx.decl_registers.get(node)) |reg| snap.regs.append(allocator, .{ .node = node, .reg = reg }) catch {};
++                if (ctx.string_materialized.get(node)) |reg| snap.strings.append(allocator, .{ .node = node, .reg = reg }) catch {};
++                const name = ctx.ast.tokenSlice(ctx.ast.mainToken(node));
++                if (ctx.local_value_decls.get(name)) |n| snap.local_vals.append(allocator, .{ .name = name, .node = n }) catch {};
++                ctx.snapshotBodyDeclStateInner(ctx.ast.data(node).lhs, snap, visited);
++                ctx.snapshotBodyDeclStateInner(ctx.ast.data(node).rhs, snap, visited);
++            },
++            .block, .stmt_list => {
++                for (ctx.ast.extraSlice(ctx.ast.data(node).lhs)) |child| ctx.snapshotBodyDeclStateInner(@intCast(child), snap, visited);
++            },
++            .if_stmt, .while_stmt, .for_stmt, .assign_stmt, .binary_expr, .index_expr, .field_access, .expr_stmt, .return_stmt, .unary_expr, .type_of_expr, .size_of_expr, .run_expr, .meta_expr, .meta_stmt => {
++                ctx.snapshotBodyDeclStateInner(ctx.ast.data(node).lhs, snap, visited);
++                ctx.snapshotBodyDeclStateInner(ctx.ast.data(node).rhs, snap, visited);
++            },
++            .call_expr => {
++                ctx.snapshotBodyDeclStateInner(ctx.ast.data(node).lhs, snap, visited);
++                if (ctx.ast.data(node).rhs < ctx.ast.extra_data.items.len) {
++                    for (ctx.ast.extraSlice(ctx.ast.data(node).rhs)) |child| ctx.snapshotBodyDeclStateInner(@intCast(child), snap, visited);
++                }
++            },
++            .typed_array_literal, .aggregate_literal, .typed_aggregate_literal => {
++                if (ctx.ast.data(node).lhs < ctx.ast.extra_data.items.len) {
++                    for (ctx.ast.extraSlice(ctx.ast.data(node).lhs)) |child| ctx.snapshotBodyDeclStateInner(@intCast(child), snap, visited);
++                }
++                if (ctx.ast.data(node).rhs < ctx.ast.extra_data.items.len) {
++                    for (ctx.ast.extraSlice(ctx.ast.data(node).rhs)) |child| ctx.snapshotBodyDeclStateInner(@intCast(child), snap, visited);
++                }
++            },
++            else => {},
++        }
++    }
++
++    fn restoreBodyDeclState(ctx: *GenContext, snap: *const BodyDeclSnapshot) void {
++        const allocator = ctx.program.allocator;
++        for (snap.type_ovr.items) |e| ctx.type_overrides.put(allocator, e.node, e.text) catch {};
++        for (snap.type_val_ovr.items) |e| ctx.type_value_overrides.put(allocator, e.node, e.text) catch {};
++        for (snap.addrs.items) |e| ctx.decl_addresses.put(allocator, e.node, e.reg) catch {};
++        for (snap.ptr_addrs.items) |e| ctx.pointer_addrs.put(allocator, e.key, e.val) catch {};
++        for (snap.regs.items) |e| ctx.decl_registers.put(allocator, e.node, e.reg) catch {};
++        for (snap.strings.items) |e| ctx.string_materialized.put(allocator, e.node, e.reg) catch {};
++        for (snap.local_vals.items) |e| ctx.local_value_decls.put(allocator, e.name, e.node) catch {};
++    }
++
+     fn removeBodyDeclState(ctx: *GenContext, node: NodeIndex) void {
+         var visited: std.AutoHashMapUnmanaged(NodeIndex, void) = .empty;
+         defer visited.deinit(ctx.program.allocator);
+@@ -6996,9 +7107,33 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
                          const lhs = ast.data(child).lhs;
                          const decl = ctx.resolved.local_values.get(lhs) orelse return diag.failAt(ast.tokens[ast.mainToken(lhs)].start, "assignment target must resolve to a local variable", .{});
                          try lhs_decls.append(ctx.program.allocator, decl);
@@ -155,7 +455,7 @@ index 671267a..5d3cfdd 100644
                  } else {
                      for (ast.extraSlice(ast.data(stmt).lhs)) |child| try ctx.genStmt(@intCast(child), diag);
                  }
-@@ -7105,11 +7129,16 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+@@ -7105,11 +7240,16 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
                          try ctx.proc.instructions.append(ctx.program.allocator, .{ .opcode = .store_ptr_byte, .dest = addr, .arg1 = rhs, .source_node = stmt });
                      } else {
                          const target_elem_type = elem_text orelse "int";
@@ -177,7 +477,7 @@ index 671267a..5d3cfdd 100644
                      }
                      return;
                  }
-@@ -7256,6 +7285,27 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+@@ -7256,6 +7396,27 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
                          }
                      }
                      const reg = try ctx.genExpr(init, diag);
@@ -205,7 +505,7 @@ index 671267a..5d3cfdd 100644
                      const ty = if (ctx.typed) |typed| typed.typeOf(stmt) else Type.init(InternPool.well_known.any_type);
                      const init_ty = if (ctx.typed) |typed| typed.typeOf(init) else Type.init(InternPool.well_known.any_type);
                      if (ast.tag(stmt) == .var_decl) {
-@@ -11699,7 +11749,15 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+@@ -11699,7 +11860,15 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
                          for (args[1..]) |item_idx| {
                              const item_node: NodeIndex = @intCast(item_idx);
                              const spread = ast.tag(item_node) == .unary_expr and ast.tokens[ast.mainToken(item_node)].tag == .dot_dot;
@@ -222,7 +522,7 @@ index 671267a..5d3cfdd 100644
                              if (spread) {
                                  const spread_src = ast.data(item_node).lhs;
                                  const spread_type = typeTextForExpr(ctx, spread_src, diag) orelse elem_ty;
-@@ -21724,6 +21782,8 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
+@@ -21724,6 +21893,8 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
      var saw_spread = false;
      var values = std.ArrayList(NodeIndex).empty;
      defer values.deinit(ctx.program.allocator);
@@ -231,7 +531,7 @@ index 671267a..5d3cfdd 100644
  
      for (raw_args) |arg_idx| {
          const arg: NodeIndex = @intCast(arg_idx);
-@@ -21752,14 +21812,10 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
+@@ -21752,14 +21923,10 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
                  const count = payload[2];
                  for (ast.extraSlice(extra)[0..count]) |item| try values.append(ctx.program.allocator, @intCast(item));
              } else {
@@ -250,7 +550,7 @@ index 671267a..5d3cfdd 100644
              }
              continue;
          }
-@@ -21780,6 +21836,11 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
+@@ -21780,6 +21947,11 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
          const value = try ctx.genExpr(value_node, diag);
          try ctx.proc.instructions.append(ctx.program.allocator, .{ .opcode = .string_builder_append_string, .arg1 = builder_slot, .arg2 = value, .source_node = value_node });
      }

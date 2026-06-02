@@ -11,18 +11,21 @@ collect_name :: (info: *File_Visit_Info, names: *[..]string) {
     array_add(names, copy_string(info.short_name));
 }
 
-list_directory :: (path: string) -> [..]string {
-    names: [..]string;
+list_directory :: (path: string) -> (names: [..]string) {
     visit_files(path, false, *names, collect_name, visit_directories = true);
     return names;
 }
 
-get_disk_byte_size :: (disk_path: string) -> int {
-    size_path := sprint("%/size", disk_path);
-    text, ok := read_entire_file(size_path);
-    if !ok then return 0;
-    sectors := to_integer(trim(text));
-    return sectors * SECTOR_SIZE;
+read_trimmed :: (path: string) -> (value: string, ok: bool) {
+    text, ok := read_entire_file(path);
+    if !ok then return "", false;
+    return trim(text), true;
+}
+
+get_byte_size :: (sys_path: string) -> (byte_size: int, ok: bool = true) {
+    text, ok := read_trimmed(sprint("%/size", sys_path));
+    if !ok then return 0, false;
+    return to_integer(text) * SECTOR_SIZE, true;
 }
 
 byte_size_to_human_readable_size :: (size: int) -> string {
@@ -39,75 +42,97 @@ basename :: (path: string) -> string {
     return parts[parts.count - 1];
 }
 
-get_mounts :: (partition_name: string) -> [..]string {
-    mounts: [..]string;
-
+get_mounts :: (device_name: string) -> (mounts: [..]string) {
     text, ok := read_entire_file("/proc/mounts");
     if !ok then return mounts;
 
-    lines := split(text, "\n");
-    for line : lines {
+    for line : split(text, "\n") {
         if equal(line, "") then continue;
 
         fields := split(line, " ");
-
-        if fields.count < 3 then continue;
+        if (fields.count < 3) then continue;
 
         dev := fields[0];
-
         if !begins_with(dev, "/dev/") then continue;
-        if !equal(partition_name, basename(dev)) then continue;
+        if !equal(device_name, basename(dev)) then continue;
 
-        mount := replace(fields[1], "\\040", " ");
-        array_add(*mounts, mount);
+        array_add(*mounts, replace(fields[1], "\\040", " "));
     }
 
     return mounts;
 }
 
-Partition :: struct {
-    name:   string;
-    size:   string;
-    mounts: [..]string;
-}
-
-get_partitions :: (disk_path: string) -> [..]Partition {
-    partitions: [..]Partition;
-    partition_names := list_directory(disk_path);
-    quick_sort(partition_names);
-    for partition_name : partition_names {
-        sub_path := sprint("%/%", disk_path, partition_name);
-
-        if !file_exists(sprint("%/partition", sub_path)) then continue;
-
-        size := byte_size_to_human_readable_size(get_disk_byte_size(sub_path));
-        mounts := get_mounts(partition_name);
-        array_add(*partitions, .{partition_name, size, mounts});
+device_kind :: (sys_path: string) -> string {
+    if file_exists(sprint("%/partition", sys_path)) then return "part";
+    uuid, ok := read_trimmed(sprint("%/dm/uuid", sys_path));
+    if ok {
+        prefix := split(uuid, "-")[0];
+        if equal(prefix, "CRYPT") then return "crypt";
+        if equal(prefix, "LVM")   then return "lvm";
+        return prefix;
     }
-    return partitions;
+    return "disk";
 }
 
-Disk :: struct {
+Device :: struct {
     name:     string;
     size:     string;
-    children: [..]Partition;
+    kind:     string;
+    mounts:   [..]string;
+    children: [..]Device;
 }
 
-get_disks :: () -> [..]Disk {
-    disks: [..]Disk;
-    disk_names := list_directory(SYS_BLOCK);
-    quick_sort(disk_names);
-    for disk_name : disk_names {
-        disk_path := sprint("%/%", SYS_BLOCK, disk_name);
+add_device :: (out: *[..]Device, sys_path: string, entry_name: string) {
+    name := entry_name;
+    dm_name, has_dm := read_trimmed(sprint("%/dm/name", sys_path));
+    if has_dm then name = dm_name;
 
-        disk_byte_size := get_disk_byte_size(disk_path);
-        disk_human_size := byte_size_to_human_readable_size(disk_byte_size);
+    byte_size, ok := get_byte_size(sys_path);
+    if !ok then print("WARNING: failed to get size for %\n", name);
 
-        partitions := get_partitions(disk_path);
+    children: [..]Device;
 
-        array_add(*disks, .{disk_name, disk_human_size, partitions});
+    partitions := list_directory(sys_path);
+    quick_sort(partitions);
+    for partition : partitions {
+        sub_path := sprint("%/%", sys_path, partition);
+        if !file_exists(sprint("%/partition", sub_path)) then continue;
+        add_device(*children, sub_path, partition);
     }
-    return disks;
+
+    holders := list_directory(sprint("%/holders", sys_path));
+    quick_sort(holders);
+    for holder : holders {
+        add_device(*children, sprint("%/%", SYS_BLOCK, holder), holder);
+    }
+
+    size := byte_size_to_human_readable_size(byte_size);
+    kind := device_kind(sys_path);
+    mounts := get_mounts(name);
+    array_add(out, .{name, size, kind, mounts, children});
+}
+
+get_devices :: () -> (devices: [..]Device) {
+    names := list_directory(SYS_BLOCK);
+    quick_sort(names);
+    for name : names {
+        sys_path := sprint("%/%", SYS_BLOCK, name);
+        slaves := list_directory(sprint("%/slaves", sys_path));
+        if slaves.count > 0 then continue;
+        add_device(*devices, sys_path, name);
+    }
+    return devices;
+}
+
+print_device :: (device: *Device, indent: string) {
+    print("%", indent);
+    print("% % %", device.name, device.size, device.kind);
+    mounts := join(.. device.mounts, separator = ", ");
+    if mounts.count > 0 then print(" %", mounts);
+    print("\n");
+
+    child_indent := sprint("%  ", indent);
+    for device.children print_device(*it, child_indent);
 }
 
 BOX_VERTICAL           :: "│";
@@ -116,8 +141,5 @@ BOX_VERTICAL_AND_RIGHT :: "├";
 BOX_HORIZONTAL         :: "─";
 
 main :: () {
-    for disk : get_disks() {
-        print("% %\n", disk.name, disk.size);
-        for part : disk.children print("  % % %\n", part.name, part.size, join(.. part.mounts, separator = ", "));
-    }
+    for get_devices() print_device(*it, "");
 }
