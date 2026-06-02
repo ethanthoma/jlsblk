@@ -48,7 +48,20 @@ basename :: (path: string) -> string {
     return parts[parts.count - 1];
 }
 
-get_mounts :: (device_name: string) -> (mounts: [..]string) {
+Mount :: struct {
+    device: string;
+    point:  string;
+}
+
+unescape_mount :: (s: string) -> string {
+    out := replace(s, "\\040", " ");
+    out = replace(out, "\\011", "\x09");
+    out = replace(out, "\\012", "\x0a");
+    out = replace(out, "\\134", "\\");
+    return out;
+}
+
+read_mounts :: () -> (mounts: [..]Mount) {
     text, ok := read_entire_file("/proc/mounts");
     if !ok then return mounts;
 
@@ -60,12 +73,18 @@ get_mounts :: (device_name: string) -> (mounts: [..]string) {
 
         dev := fields[0];
         if !begins_with(dev, "/dev/") then continue;
-        if !equal(device_name, basename(dev)) then continue;
 
-        array_add(*mounts, replace(fields[1], "\\040", " "));
+        array_add(*mounts, .{basename(dev), unescape_mount(fields[1])});
     }
 
     return mounts;
+}
+
+get_mounts :: (device_name: string, all_mounts: [..]Mount) -> (points: [..]string) {
+    for * m : all_mounts {
+        if equal(m.device, device_name) then array_add(*points, m.point);
+    }
+    return points;
 }
 
 device_kind :: (sys_path: string) -> string {
@@ -88,7 +107,7 @@ Device :: struct {
     children: [..]Device;
 }
 
-add_device :: (out: *[..]Device, sys_path: string, entry_name: string) {
+add_device :: (out: *[..]Device, sys_path: string, entry_name: string, all_mounts: [..]Mount) {
     name := entry_name;
     dm_name, has_dm := read_trimmed(sprint("%/dm/name", sys_path));
     if has_dm then name = dm_name;
@@ -103,29 +122,30 @@ add_device :: (out: *[..]Device, sys_path: string, entry_name: string) {
     for partition : partitions {
         sub_path := sprint("%/%", sys_path, partition);
         if !file_exists(sprint("%/partition", sub_path)) then continue;
-        add_device(*children, sub_path, partition);
+        add_device(*children, sub_path, partition, all_mounts);
     }
 
     holders := list_directory(sprint("%/holders", sys_path));
     quick_sort(holders);
     for holder : holders {
-        add_device(*children, sprint("%/%", SYS_BLOCK, holder), holder);
+        add_device(*children, sprint("%/%", SYS_BLOCK, holder), holder, all_mounts);
     }
 
     size := byte_size_to_human_readable_size(byte_size);
     kind := device_kind(sys_path);
-    mounts := get_mounts(name);
+    mounts := get_mounts(name, all_mounts);
     array_add(out, .{name, size, kind, mounts, children});
 }
 
 get_devices :: () -> (devices: [..]Device) {
+    all_mounts := read_mounts();
     names := list_directory(SYS_BLOCK);
     quick_sort(names);
     for name : names {
         sys_path := sprint("%/%", SYS_BLOCK, name);
         slaves := list_directory(sprint("%/slaves", sys_path));
         if slaves.count > 0 then continue;
-        add_device(*devices, sys_path, name);
+        add_device(*devices, sys_path, name, all_mounts);
     }
     return devices;
 }
