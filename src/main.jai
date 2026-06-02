@@ -31,12 +31,16 @@ get_byte_size :: (sys_path: string) -> (byte_size: int = 0, ok: bool = true) {
 }
 
 byte_size_to_human_readable_size :: (size: int) -> string {
-    s, unit := size, "B";
+    divisor, unit := 1, "B";
     for string.["K", "M", "G", "T", "P"] {
-        if s < 1024 break;
-        s, unit = s / 1024, it;
+        if size < divisor * 1024 break;
+        divisor *= 1024;
+        unit = it;
     }
-    return sprint("%%", s, unit);
+    total := (size * 10 + divisor / 2) / divisor;
+    whole, frac := total / 10, total % 10;
+    if frac == 0 then return sprint("%%", whole, unit);
+    return sprint("%.%%", whole, frac, unit);
 }
 
 basename :: (path: string) -> string {
