@@ -41,13 +41,8 @@ byte_size_to_human_readable_size :: (size: int) -> string {
     return sprint("%.%%", total / 10, total % 10, unit);
 }
 
-basename :: (path: string) -> string {
-    parts := split(path, "/");
-    return parts[parts.count - 1];
-}
-
 Mount :: struct {
-    device: string;
+    majmin: string;
     point:  string;
 }
 
@@ -60,27 +55,24 @@ unescape_mount :: (s: string) -> (out: string = s) {
 }
 
 read_mounts :: () -> (mounts: [..]Mount) {
-    text, ok := read_entire_file("/proc/mounts");
+    text, ok := read_entire_file("/proc/self/mountinfo");
     if !ok then return mounts;
 
     for line : split(text, "\n") {
         if equal(line, "") then continue;
 
         fields := split(line, " ");
-        if (fields.count < 3) then continue;
+        if (fields.count < 5) then continue;
 
-        dev := fields[0];
-        if !begins_with(dev, "/dev/") then continue;
-
-        array_add(*mounts, .{basename(dev), unescape_mount(fields[1])});
+        array_add(*mounts, .{fields[2], unescape_mount(fields[4])});
     }
 
     return mounts;
 }
 
-get_mounts :: (device_name: string, all_mounts: [..]Mount) -> (points: [..]string) {
+get_mounts :: (majmin: string, all_mounts: [..]Mount) -> (points: [..]string) {
     for * m : all_mounts {
-        if equal(m.device, device_name) then array_add(*points, m.point);
+        if equal(m.majmin, majmin) then array_add(*points, m.point);
     }
     return points;
 }
@@ -131,7 +123,8 @@ add_device :: (out: *[..]Device, sys_path: string, entry_name: string, all_mount
 
     size := byte_size_to_human_readable_size(byte_size);
     kind := device_kind(sys_path);
-    mounts := get_mounts(name, all_mounts);
+    majmin, _ := read_trimmed(sprint("%/dev", sys_path));
+    mounts := get_mounts(majmin, all_mounts);
     array_add(out, .{name, size, kind, mounts, children});
 }
 
