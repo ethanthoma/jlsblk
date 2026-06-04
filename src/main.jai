@@ -225,36 +225,53 @@ MAGENTA :: "\x1b[38;2;215;46;130m";
 VIOLET  :: "\x1b[38;2;135;90;251m";
 ORANGE  :: "\x1b[38;2;255;122;0m";
 
-color_for_kind :: (kind: string) -> string {
-    if equal(kind, "disk")  then return BOLD;
-    if equal(kind, "crypt") then return sprint("%%", BOLD, YELLOW);
-    if equal(kind, "lvm")   then return sprint("%%", BOLD, MAGENTA);
+ColorMode :: enum { AUTO; NONE; ANSI; TRUE; }
+Hue       :: enum { GREEN; RED; YELLOW; MAGENTA; }
+
+hue_code :: (h: Hue, mode: ColorMode) -> string {
+    if mode == .NONE then return "";
+
+    if h == {
+        case .GREEN;   return ifx mode == .TRUE then GREEN   else "\x1b[32m";
+        case .RED;     return ifx mode == .TRUE then RED     else "\x1b[31m";
+        case .YELLOW;  return ifx mode == .TRUE then YELLOW  else "\x1b[33m";
+        case .MAGENTA; return ifx mode == .TRUE then MAGENTA else "\x1b[35m";
+    }
+
     return "";
 }
 
-colorize :: (s: string, kind: string, use_color: bool) -> string {
-    if !use_color then return s;
-    color := color_for_kind(kind);
+color_for_kind :: (kind: string, mode: ColorMode) -> string {
+    if mode == .NONE        then return "";
+    if equal(kind, "disk")  then return BOLD;
+    if equal(kind, "crypt") then return sprint("%%", BOLD, hue_code(.YELLOW, mode));
+    if equal(kind, "lvm")   then return sprint("%%", BOLD, hue_code(.MAGENTA, mode));
+    return "";
+}
+
+colorize :: (s: string, kind: string, mode: ColorMode) -> string {
+    color := color_for_kind(kind, mode);
     if color.count == 0 then return s;
     return sprint("%%%", color, s, RESET);
 }
 
-dim :: (s: string, use: bool) -> string {
-    if !use then return s;
+dim :: (s: string, mode: ColorMode) -> string {
+    if mode == .NONE then return s;
     return sprint("%%%", DIM, s, RESET);
 }
 
 GIB :: 1024 * 1024 * 1024;
 
-color_for_avail :: (bytes: int) -> string {
-    if bytes < 1  * GIB then return RED;
-    if bytes < 10 * GIB then return YELLOW;
-    return GREEN;
+color_for_avail :: (bytes: int, mode: ColorMode) -> string {
+    if bytes < 1  * GIB then return hue_code(.RED, mode);
+    if bytes < 10 * GIB then return hue_code(.YELLOW, mode);
+    return hue_code(.GREEN, mode);
 }
 
-colorize_avail :: (s: string, bytes: int, use_color: bool) -> string {
-    if !use_color then return s;
-    return sprint("%%%", color_for_avail(bytes), s, RESET);
+colorize_avail :: (s: string, bytes: int, mode: ColorMode) -> string {
+    color := color_for_avail(bytes, mode);
+    if color.count == 0 then return s;
+    return sprint("%%%", color, s, RESET);
 }
 
 Row :: struct {
@@ -337,16 +354,16 @@ cell_width :: (r: *Row, f: Field) -> int {
     return w;
 }
 
-render_cell :: (r: *Row, col: Column, w: int, tty: bool, header: bool) -> string {
+render_cell :: (r: *Row, col: Column, w: int, mode: ColorMode, header: bool) -> string {
     text := cell(r, col.field);
     if col.field == .NAME {
         gap := repeat(w - display_width(r.prefix) - display_width(text));
-        return sprint("%%%", r.prefix, colorize(text, r.kind, tty), gap);
+        return sprint("%%%", r.prefix, colorize(text, r.kind, mode), gap);
     }
     padded := pad_right(text, w);
     if col.align == .RIGHT then padded = pad_left(text, w);
-    if col.field == .TYPE  && tty && !header then padded = dim(padded, true);
-    if col.field == .AVAIL && tty && !header && text.count > 0 then padded = colorize_avail(padded, r.avail_bytes, true);
+    if col.field == .TYPE  && !header then padded = dim(padded, mode);
+    if col.field == .AVAIL && !header && text.count > 0 then padded = colorize_avail(padded, r.avail_bytes, mode);
     return padded;
 }
 
@@ -359,10 +376,10 @@ print_rule :: (left: string, mid: string, right: string, widths: [] int) {
     print("%\n", right);
 }
 
-print_row :: (r: *Row, widths: [] int, tty: bool, header: bool) {
+print_row :: (r: *Row, widths: [] int, tty: bool, mode: ColorMode, header: bool) {
     if tty {
         print("%", BOX_VERTICAL);
-        for col, i : COLUMNS  print(" % %", render_cell(r, col, widths[i], tty, header), BOX_VERTICAL);
+        for col, i : COLUMNS  print(" % %", render_cell(r, col, widths[i], mode, header), BOX_VERTICAL);
         print("\n");
         return;
     }
@@ -370,12 +387,12 @@ print_row :: (r: *Row, widths: [] int, tty: bool, header: bool) {
     line := "";
     for col, i : COLUMNS {
         if i > 0 then line = sprint("% ", line);
-        line = sprint("%%", line, render_cell(r, col, widths[i], false, header));
+        line = sprint("%%", line, render_cell(r, col, widths[i], mode, header));
     }
     print("%\n", trim_right(line));
 }
 
-render :: (devices: [..]Device) {
+render :: (devices: [..]Device, mode: ColorMode) {
     rows: [..]Row;
     array_add(*rows, .{"NAME", "SIZE", "TYPE", "MOUNTPOINTS", "AVAIL", "USE%", 0, "", false});
 
@@ -394,7 +411,7 @@ render :: (devices: [..]Device) {
     tty := isatty(1) != 0;
 
     if tty then print_rule(BOX_TOP_LEFT, BOX_T_DOWN, BOX_TOP_RIGHT, widths);
-    print_row(*rows[0], widths, tty, true);
+    print_row(*rows[0], widths, tty, mode, true);
     if tty then print_rule(BOX_VERTICAL_AND_RIGHT, BOX_CROSS, BOX_VERTICAL_AND_LEFT, widths);
 
     seen_top := false;
@@ -407,12 +424,46 @@ render :: (devices: [..]Device) {
             }
             seen_top = true;
         }
-        print_row(r, widths, tty, false);
+        print_row(r, widths, tty, mode, false);
     }
 
     if tty then print_rule(BOX_BOTTOM_LEFT, BOX_T_UP, BOX_BOTTOM_RIGHT, widths);
 }
 
+color_mode_from_string :: (value: string) -> ColorMode {
+    if value == {
+        case "never"; #through;
+        case "none";                  return .NONE;
+        case "ansi"; #through;
+        case "terminal";              return .ANSI;
+        case "true"; #through;
+        case "builtin";               return .TRUE;
+        case "auto";                  return .AUTO;
+    }
+    print("jlsblk: unknown --color value '%' (use auto|never|ansi|true)\n", value);
+    return .AUTO;
+}
+
+resolve_color_mode :: () -> ColorMode {
+    mode := ColorMode.AUTO;
+    args := get_command_line_arguments();
+    for i : 1..args.count - 1 {
+        a := args[i];
+        if begins_with(a, "--color=") {
+            parts := split(a, "=");
+            if parts.count >= 2 then mode = color_mode_from_string(parts[1]);
+        } else if equal(a, "--color") && i + 1 < args.count {
+            mode = color_mode_from_string(args[i + 1]);
+        }
+    }
+
+    if mode == .AUTO {
+        if isatty(1) != 0 then return .TRUE;
+        return .NONE;
+    }
+    return mode;
+}
+
 main :: () {
-    render(get_devices());
+    render(get_devices(), resolve_color_mode());
 }

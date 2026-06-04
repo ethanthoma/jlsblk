@@ -28,6 +28,20 @@ nix develop
 ./run
 ```
 
+## Usage
+
+There are four color modes:
+
+```bash
+jlsblk --color auto # true color, turns off color when piped
+
+jlsblk --color true # true color
+
+jlsblk --color ansi # uses terminal set colors
+
+jlsblk --color none # no color
+```
+
 ## Install
 
 NixOS config:
