@@ -51,8 +51,8 @@ Mount :: struct {
     point:  string;
 }
 
-unescape_mount :: (s: string) -> string {
-    out := replace(s, "\\040", " ");
+unescape_mount :: (s: string) -> (out: string = s) {
+    out = replace(out, "\\040", " ");
     out = replace(out, "\\011", "\x09");
     out = replace(out, "\\012", "\x0a");
     out = replace(out, "\\134", "\\");
@@ -185,13 +185,57 @@ pad_left :: (s: string, width: int) -> string {
 
 isatty :: (fd: s32) -> s32 #foreign;
 
+Statvfs :: struct {
+    f_bsize:   int;
+    f_frsize:  int;
+    f_blocks:  int;
+    f_bfree:   int;
+    f_bavail:  int;
+    f_files:   int;
+    f_ffree:   int;
+    f_favail:  int;
+    f_fsid:    int;
+    f_flag:    int;
+    f_namemax: int;
+    f_spare:   [6] s32;
+}
+
+statvfs :: (path: *u8, buf: *Statvfs) -> s32 #foreign;
+
+disk_usage :: (mount: string) -> (avail: string = "", usep: string = "", avail_bytes: int = 0) {
+    buf: Statvfs;
+
+    if statvfs(to_c_string(mount), *buf) != 0 then return "", "", 0;
+    if buf.f_blocks == 0 then return "", "", 0;
+
+    used := buf.f_blocks - buf.f_bfree;
+    denom := used + buf.f_bavail;
+
+    if denom <= 0 then return "", "", 0;
+
+    pct := (used * 100 + denom - 1) / denom;
+    bytes := buf.f_bavail * buf.f_frsize;
+    return byte_size_to_human_readable_size(bytes), sprint("%\%", pct), bytes;
+}
+
 RESET :: "\x1b[0m";
 DIM   :: "\x1b[2m";
+BOLD  :: "\x1b[1m";
+
+// Palette (24-bit truecolor)
+GREEN   :: "\x1b[38;2;0;174;107m";
+RED     :: "\x1b[38;2;242;40;60m";
+BLUE    :: "\x1b[38;2;0;102;204m";
+CYAN    :: "\x1b[38;2;0;161;180m";
+YELLOW  :: "\x1b[38;2;255;194;0m";
+MAGENTA :: "\x1b[38;2;215;46;130m";
+VIOLET  :: "\x1b[38;2;135;90;251m";
+ORANGE  :: "\x1b[38;2;255;122;0m";
 
 color_for_kind :: (kind: string) -> string {
-    if equal(kind, "disk")  then return "\x1b[1m";      // bold
-    if equal(kind, "crypt") then return "\x1b[1;33m";   // bold yellow
-    if equal(kind, "lvm")   then return "\x1b[1;35m";   // bold magenta
+    if equal(kind, "disk")  then return BOLD;
+    if equal(kind, "crypt") then return sprint("%%", BOLD, YELLOW);
+    if equal(kind, "lvm")   then return sprint("%%", BOLD, MAGENTA);
     return "";
 }
 
@@ -207,81 +251,140 @@ dim :: (s: string, use: bool) -> string {
     return sprint("%%%", DIM, s, RESET);
 }
 
+GIB :: 1024 * 1024 * 1024;
+
+color_for_avail :: (bytes: int) -> string {
+    if bytes < 1  * GIB then return RED;
+    if bytes < 10 * GIB then return YELLOW;
+    return GREEN;
+}
+
+colorize_avail :: (s: string, bytes: int, use_color: bool) -> string {
+    if !use_color then return s;
+    return sprint("%%%", color_for_avail(bytes), s, RESET);
+}
+
 Row :: struct {
-    name:   string;
-    size:   string;
-    kind:   string;
-    mounts: string;
-    prefix: string;
-    top:    bool;
+    name:        string;
+    size:        string;
+    kind:        string;
+    mounts:      string;
+    avail:       string;
+    usep:        string;
+    avail_bytes: int;
+    prefix:      string;
+    top:         bool;
 }
 
 build_rows :: (device: *Device, prefix: string, is_root: bool, is_last: bool, rows: *[..]Row) {
-    name := device.name;
-    connector := "";
+    name        := device.name;
+    connector   := "";
+
     if !is_root {
         connector = sprint("%%", BOX_VERTICAL_AND_RIGHT, BOX_HORIZONTAL);
         if is_last then connector = sprint("%%", BOX_UP_AND_RIGHT, BOX_HORIZONTAL);
     }
-    mounts := join(.. device.mounts, separator = ", ");
-    array_add(rows, .{name, device.size, device.kind, mounts, sprint("%%", prefix, connector), is_root});
+
+    mounts      := join(.. device.mounts, separator = ", ");
+    avail, usep := "", "";
+    avail_bytes := 0;
+
+    if device.mounts.count > 0 {
+        a, u, ab := disk_usage(device.mounts[0]);
+        avail = a;
+        usep = u;
+        avail_bytes = ab;
+    }
+
+    array_add(rows, .{name, device.size, device.kind, mounts, avail, usep, avail_bytes, sprint("%%", prefix, connector), is_root});
 
     child_prefix := "";
+
     if !is_root {
         continuation := sprint("%%", BOX_VERTICAL, " ");
         if is_last then continuation = "  ";
         child_prefix = sprint("%%", prefix, continuation);
     }
 
-    count := device.children.count;
+    count        := device.children.count;
     for i : 0..count - 1 {
         build_rows(*device.children[i], child_prefix, false, i == count - 1, rows);
     }
 }
 
-Cols :: struct {
-    name:  int;
-    size:  int;
-    kind:  int;
-    mount: int;
+Field :: enum { NAME; SIZE; TYPE; AVAIL; USEP; MOUNT; }
+Align :: enum { LEFT; RIGHT; }
+
+Column :: struct {
+    field: Field;
+    align: Align;
 }
 
-print_rule :: (left: string, mid: string, right: string, c: Cols) {
+COLUMNS :: Column.[
+    .{.NAME,  .LEFT},
+    .{.SIZE,  .RIGHT},
+    .{.AVAIL, .RIGHT},
+    .{.USEP,  .RIGHT},
+    .{.TYPE,  .LEFT},
+    .{.MOUNT, .LEFT},
+];
+
+cell :: (r: *Row, f: Field) -> string {
+    if f == .NAME  then return r.name;
+    if f == .SIZE  then return r.size;
+    if f == .TYPE  then return r.kind;
+    if f == .AVAIL then return r.avail;
+    if f == .USEP  then return r.usep;
+    return r.mounts;
+}
+
+cell_width :: (r: *Row, f: Field) -> int {
+    w := display_width(cell(r, f));
+    if f == .NAME then w += display_width(r.prefix);
+    return w;
+}
+
+render_cell :: (r: *Row, col: Column, w: int, tty: bool, header: bool) -> string {
+    text := cell(r, col.field);
+    if col.field == .NAME {
+        gap := repeat(w - display_width(r.prefix) - display_width(text));
+        return sprint("%%%", r.prefix, colorize(text, r.kind, tty), gap);
+    }
+    padded := pad_right(text, w);
+    if col.align == .RIGHT then padded = pad_left(text, w);
+    if col.field == .TYPE  && tty && !header then padded = dim(padded, true);
+    if col.field == .AVAIL && tty && !header && text.count > 0 then padded = colorize_avail(padded, r.avail_bytes, true);
+    return padded;
+}
+
+print_rule :: (left: string, mid: string, right: string, widths: [] int) {
     print("%", left);
-    print("%", repeat(c.name + 2, BOX_HORIZONTAL));
-    print("%", mid);
-    print("%", repeat(c.size + 2, BOX_HORIZONTAL));
-    print("%", mid);
-    print("%", repeat(c.kind + 2, BOX_HORIZONTAL));
-    print("%", mid);
-    print("%", repeat(c.mount + 2, BOX_HORIZONTAL));
+    for w, i : widths {
+        if i > 0 then print("%", mid);
+        print("%", repeat(w + 2, BOX_HORIZONTAL));
+    }
     print("%\n", right);
 }
 
-print_row :: (r: *Row, c: Cols, tty: bool, header: bool) {
-    namepad := repeat(c.name - display_width(r.prefix) - display_width(r.name));
-    name := colorize(r.name, r.kind, tty);
-
-    if !tty {
-        if r.mounts.count > 0 {
-            print("%%% % % %\n", r.prefix, name, namepad, pad_left(r.size, c.size), pad_right(r.kind, c.kind), r.mounts);
-        } else {
-            print("%%% % %\n", r.prefix, name, namepad, pad_left(r.size, c.size), r.kind);
-        }
+print_row :: (r: *Row, widths: [] int, tty: bool, header: bool) {
+    if tty {
+        print("%", BOX_VERTICAL);
+        for col, i : COLUMNS  print(" % %", render_cell(r, col, widths[i], tty, header), BOX_VERTICAL);
+        print("\n");
         return;
     }
 
-    type_cell := dim(pad_right(r.kind, c.kind), !header);
-    print("% %%% ", BOX_VERTICAL, r.prefix, name, namepad);
-    print("% % ", BOX_VERTICAL, pad_left(r.size, c.size));
-    print("% % ", BOX_VERTICAL, type_cell);
-    print("% % ", BOX_VERTICAL, pad_right(r.mounts, c.mount));
-    print("%\n", BOX_VERTICAL);
+    line := "";
+    for col, i : COLUMNS {
+        if i > 0 then line = sprint("% ", line);
+        line = sprint("%%", line, render_cell(r, col, widths[i], false, header));
+    }
+    print("%\n", trim_right(line));
 }
 
 render :: (devices: [..]Device) {
     rows: [..]Row;
-    array_add(*rows, .{"NAME", "SIZE", "TYPE", "MOUNTPOINTS", "", false});
+    array_add(*rows, .{"NAME", "SIZE", "TYPE", "MOUNTPOINTS", "AVAIL", "USE%", 0, "", false});
 
     count := devices.count;
     if count > 0 {
@@ -290,35 +393,31 @@ render :: (devices: [..]Device) {
         }
     }
 
-    name_width, size_width, kind_width, mount_width := 0, 0, 0, 0;
+    widths: [COLUMNS.count] int;
     for * r : rows {
-        name_width = max(name_width, display_width(r.prefix) + display_width(r.name));
-        size_width = max(size_width, display_width(r.size));
-        kind_width = max(kind_width, display_width(r.kind));
-        mount_width = max(mount_width, display_width(r.mounts));
+        for col, i : COLUMNS  widths[i] = max(widths[i], cell_width(r, col.field));
     }
-    c: Cols = .{name_width, size_width, kind_width, mount_width};
 
     tty := isatty(1) != 0;
 
-    if tty then print_rule(BOX_TOP_LEFT, BOX_T_DOWN, BOX_TOP_RIGHT, c);
-    print_row(*rows[0], c, tty, true);
-    if tty then print_rule(BOX_VERTICAL_AND_RIGHT, BOX_CROSS, BOX_VERTICAL_AND_LEFT, c);
+    if tty then print_rule(BOX_TOP_LEFT, BOX_T_DOWN, BOX_TOP_RIGHT, widths);
+    print_row(*rows[0], widths, tty, true);
+    if tty then print_rule(BOX_VERTICAL_AND_RIGHT, BOX_CROSS, BOX_VERTICAL_AND_LEFT, widths);
 
     seen_top := false;
     for i : 1..rows.count - 1 {
         r := *rows[i];
         if r.top {
             if seen_top {
-                if tty then print_rule(BOX_VERTICAL_AND_RIGHT, BOX_CROSS, BOX_VERTICAL_AND_LEFT, c);
+                if tty then print_rule(BOX_VERTICAL_AND_RIGHT, BOX_CROSS, BOX_VERTICAL_AND_LEFT, widths);
                 else print("\n");
             }
             seen_top = true;
         }
-        print_row(r, c, tty, false);
+        print_row(r, widths, tty, false);
     }
 
-    if tty then print_rule(BOX_BOTTOM_LEFT, BOX_T_UP, BOX_BOTTOM_RIGHT, c);
+    if tty then print_rule(BOX_BOTTOM_LEFT, BOX_T_UP, BOX_BOTTOM_RIGHT, widths);
 }
 
 main :: () {

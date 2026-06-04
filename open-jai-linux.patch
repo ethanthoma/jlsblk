@@ -322,7 +322,7 @@ index 6b17bdb..5466a27 100644
                  break :blk switch (ast.tag(value_node)) {
                      .var_decl => if (ast.data(value_node).rhs == using_param_sentinel)
 diff --git a/bootstrap/src/bytecode_gen.zig b/bootstrap/src/bytecode_gen.zig
-index 671267a..7199ef3 100644
+index 671267a..f761ceb 100644
 --- a/bootstrap/src/bytecode_gen.zig
 +++ b/bootstrap/src/bytecode_gen.zig
 @@ -1717,7 +1717,7 @@ const GenContext = struct {
@@ -585,7 +585,66 @@ index 671267a..7199ef3 100644
                              if (spread) {
                                  const spread_src = ast.data(item_node).lhs;
                                  const spread_type = typeTextForExpr(ctx, spread_src, diag) orelse elem_ty;
-@@ -20821,12 +20990,6 @@ fn emitFormattedPrint(ctx: *GenContext, fmt_node: NodeIndex, arg_nodes: []const
+@@ -14355,6 +14524,16 @@ fn evalIntegerConstExpr(ctx: *GenContext, node: NodeIndex, diag: Diagnostic) !i6
+                 if (ctx.polymorph_ints.get(base_name)) |v| {
+                     if (std.mem.eql(u8, field_name, "value")) break :blk v;
+                 }
++                if (std.mem.eql(u8, field_name, "count")) {
++                    const decl_opt = ctx.resolved.local_values.get(base) orelse blk_arr: {
++                        if (ctx.resolved.lookup(base_name)) |sym| switch (sym) {
++                            .const_value => |value_node| break :blk_arr value_node,
++                            else => {},
++                        };
++                        break :blk_arr @import("Ast.zig").null_node;
++                    };
++                    if (arrayLiteralElementCount(ctx, decl_opt)) |n| break :blk @intCast(n);
++                }
+             }
+             return diag.failAt(ast.tokens[ast.mainToken(node)].start, "unsupported field access in integer constant option", .{});
+         },
+@@ -16291,6 +16470,20 @@ fn typeValuedIdentifierUseText(ctx: *GenContext, expr: NodeIndex) ?[]const u8 {
+     return null;
+ }
+ 
++fn arrayLiteralElementCount(ctx: *GenContext, node_in: NodeIndex) ?usize {
++    const ast = ctx.ast;
++    var node = node_in;
++    if (node == @import("Ast.zig").null_node or node >= ast.node_tags.items.len) return null;
++    if (ast.tag(node) == .const_decl) {
++        node = ast.data(node).lhs;
++        if (node == @import("Ast.zig").null_node or node >= ast.node_tags.items.len) return null;
++    }
++    if (ast.tag(node) != .typed_array_literal) return null;
++    const payload = ast.extraSlice(ast.data(node).lhs);
++    if (payload.len < 2) return null;
++    return ast.extraSlice(payload[1]).len;
++}
++
+ fn typeArrayLiteralElementText(ctx: *GenContext, node: NodeIndex, index: usize) ?[]const u8 {
+     const ast = ctx.ast;
+     if (node == @import("Ast.zig").null_node or node >= ast.node_tags.items.len or ast.tag(node) != .typed_array_literal) return null;
+@@ -16968,6 +17161,20 @@ fn staticArrayCountFromText(ctx: *GenContext, raw: []const u8, diag: Diagnostic)
+     const count_text = std.mem.trim(u8, ty[1..close], " \t\r\n");
+     if (count_text.len == 0) return null;
+     if (std.fmt.parseInt(u64, count_text, 10)) |count| return count else |_| {}
++    if (std.mem.endsWith(u8, count_text, ".count")) {
++        const base_name = std.mem.trim(u8, count_text[0 .. count_text.len - ".count".len], " \t\r\n");
++        if (base_name.len > 0) {
++            if (topLevelConstDeclByName(ctx.ast, base_name)) |d| {
++                if (arrayLiteralElementCount(ctx, d)) |n| return @intCast(n);
++            }
++            if (ctx.resolved.lookup(base_name)) |sym| switch (sym) {
++                .const_value => |node| {
++                    if (arrayLiteralElementCount(ctx, node)) |n| return @intCast(n);
++                },
++                else => {},
++            };
++        }
++    }
+     if (evalIntegerTextExpr(ctx, count_text)) |count| {
+         if (count >= 0) return @intCast(count);
+     } else |_| {}
+@@ -20821,12 +21028,6 @@ fn emitFormattedPrint(ctx: *GenContext, fmt_node: NodeIndex, arg_nodes: []const
              start = i + 1;
              continue;
          }
@@ -598,7 +657,7 @@ index 671267a..7199ef3 100644
          if (start < i) try emitLiteralPrint(program, proc, fmt[start..i], fmt_node);
          var selected_arg_index = arg_index;
          var next_start = i + 1;
-@@ -21724,6 +21887,8 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
+@@ -21724,6 +21925,8 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
      var saw_spread = false;
      var values = std.ArrayList(NodeIndex).empty;
      defer values.deinit(ctx.program.allocator);
@@ -607,7 +666,7 @@ index 671267a..7199ef3 100644
  
      for (raw_args) |arg_idx| {
          const arg: NodeIndex = @intCast(arg_idx);
-@@ -21752,14 +21917,10 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
+@@ -21752,14 +21955,10 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
                  const count = payload[2];
                  for (ast.extraSlice(extra)[0..count]) |item| try values.append(ctx.program.allocator, @intCast(item));
              } else {
@@ -626,7 +685,7 @@ index 671267a..7199ef3 100644
              }
              continue;
          }
-@@ -21780,6 +21941,11 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
+@@ -21780,6 +21979,11 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
          const value = try ctx.genExpr(value_node, diag);
          try ctx.proc.instructions.append(ctx.program.allocator, .{ .opcode = .string_builder_append_string, .arg1 = builder_slot, .arg2 = value, .source_node = value_node });
      }
