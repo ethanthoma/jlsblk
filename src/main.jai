@@ -176,7 +176,67 @@ pad_left :: (s: string, width: int) -> string {
     return sprint("%%", repeat(width - display_width(s)), s);
 }
 
+substr :: (s: string, start: int, count: int) -> (result: string) {
+    result.data  = s.data + start;
+    result.count = count;
+    return result;
+}
+
+wrap_to_width :: (s: string, width: int) -> (lines: [..]string) {
+    limit := ifx width < 1 then 1 else width;
+
+    line := "";
+    for word : split(s, " ") {
+        chunks: [..]string;
+        if display_width(word) > limit {
+            start, w := 0, 0;
+            for i : 0..word.count - 1 {
+                if (word[i] & 0xC0) == 0x80 then continue;
+                if w == limit {
+                    array_add(*chunks, substr(word, start, i - start));
+                    start, w = i, 0;
+                }
+                w += 1;
+            }
+            array_add(*chunks, substr(word, start, word.count - start));
+        } else {
+            array_add(*chunks, word);
+        }
+
+        for chunk : chunks {
+            if line.count == 0 {
+                line = chunk;
+            } else if display_width(line) + 1 + display_width(chunk) <= limit {
+                line = sprint("% %", line, chunk);
+            } else {
+                array_add(*lines, line);
+                line = chunk;
+            }
+        }
+    }
+    array_add(*lines, line);
+    return lines;
+}
+
 isatty :: (fd: s32) -> s32 #foreign;
+
+Winsize :: struct {
+    ws_row:    u16;
+    ws_col:    u16;
+    ws_xpixel: u16;
+    ws_ypixel: u16;
+}
+
+TIOCGWINSZ :: 0x5413;
+
+ioctl :: (fd: s32, request: u64, arg: *Winsize) -> s32 #foreign;
+
+term_width :: () -> int {
+    ws: Winsize;
+    if ioctl(1, TIOCGWINSZ, *ws) != 0 then return 80;
+    if ws.ws_col == 0 then return 80;
+    return ws.ws_col;
+}
 
 Statvfs :: struct {
     f_bsize:   int;
@@ -322,6 +382,8 @@ build_rows :: (device: *Device, prefix: string, is_root: bool, is_last: bool, ro
     }
 }
 
+MIN_MOUNT_WIDTH :: 8;
+
 Field :: enum { NAME; SIZE; TYPE; AVAIL; USEP; MOUNT; }
 Align :: enum { LEFT; RIGHT; }
 
@@ -376,20 +438,31 @@ print_rule :: (left: string, mid: string, right: string, widths: [] int) {
     print("%\n", right);
 }
 
-print_row :: (r: *Row, widths: [] int, tty: bool, mode: ColorMode, header: bool) {
-    if tty {
-        print("%", BOX_VERTICAL);
-        for col, i : COLUMNS  print(" % %", render_cell(r, col, widths[i], mode, header), BOX_VERTICAL);
-        print("\n");
-        return;
-    }
+Frame :: struct {
+    start: string;
+    sep:   string;
+    end:   string;
+    rules: bool;
+}
 
-    line := "";
-    for col, i : COLUMNS {
-        if i > 0 then line = sprint("% ", line);
-        line = sprint("%%", line, render_cell(r, col, widths[i], mode, header));
+GRID  :: Frame.{ "│ ", " │ ", " │", true };
+PLAIN :: Frame.{ "",   " ",   "",   false };
+
+print_row :: (r: *Row, widths: [] int, frame: Frame, mode: ColorMode, header: bool) {
+    mount_lines: [..]string;
+    for col, i : COLUMNS if col.field == .MOUNT then mount_lines = wrap_to_width(r.mounts, widths[i]);
+
+    for k : 0..max(1, mount_lines.count) - 1 {
+        line := frame.start;
+        for col, i : COLUMNS {
+            if i > 0 then line = sprint("%%", line, frame.sep);
+            cell_str := repeat(widths[i]);
+            if col.field == .MOUNT then cell_str = pad_right(ifx k < mount_lines.count then mount_lines[k] else "", widths[i]);
+            else if k == 0         then cell_str = render_cell(r, col, widths[i], mode, header);
+            line = sprint("%%", line, cell_str);
+        }
+        print("%\n", trim_right(sprint("%%", line, frame.end)));
     }
-    print("%\n", trim_right(line));
 }
 
 render :: (devices: [..]Device, mode: ColorMode) {
@@ -410,24 +483,37 @@ render :: (devices: [..]Device, mode: ColorMode) {
 
     tty := isatty(1) != 0;
 
-    if tty then print_rule(BOX_TOP_LEFT, BOX_T_DOWN, BOX_TOP_RIGHT, widths);
-    print_row(*rows[0], widths, tty, mode, true);
-    if tty then print_rule(BOX_VERTICAL_AND_RIGHT, BOX_CROSS, BOX_VERTICAL_AND_LEFT, widths);
+    if tty {
+        total := 1;
+        for w : widths  total += w + 3;
+
+        for col, i : COLUMNS {
+            if col.field != .MOUNT then continue;
+            budget := widths[i] - (total - term_width());
+            widths[i] = min(widths[i], max(budget, MIN_MOUNT_WIDTH));
+        }
+    }
+
+    frame := ifx tty then GRID else PLAIN;
+
+    if frame.rules then print_rule(BOX_TOP_LEFT, BOX_T_DOWN, BOX_TOP_RIGHT, widths);
+    print_row(*rows[0], widths, frame, mode, true);
+    if frame.rules then print_rule(BOX_VERTICAL_AND_RIGHT, BOX_CROSS, BOX_VERTICAL_AND_LEFT, widths);
 
     seen_top := false;
     for i : 1..rows.count - 1 {
         r := *rows[i];
         if r.top {
             if seen_top {
-                if tty then print_rule(BOX_VERTICAL_AND_RIGHT, BOX_CROSS, BOX_VERTICAL_AND_LEFT, widths);
+                if frame.rules then print_rule(BOX_VERTICAL_AND_RIGHT, BOX_CROSS, BOX_VERTICAL_AND_LEFT, widths);
                 else print("\n");
             }
             seen_top = true;
         }
-        print_row(r, widths, tty, mode, false);
+        print_row(r, widths, frame, mode, false);
     }
 
-    if tty then print_rule(BOX_BOTTOM_LEFT, BOX_T_UP, BOX_BOTTOM_RIGHT, widths);
+    if frame.rules then print_rule(BOX_BOTTOM_LEFT, BOX_T_UP, BOX_BOTTOM_RIGHT, widths);
 }
 
 color_mode_from_string :: (value: string) -> ColorMode {
