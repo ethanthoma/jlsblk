@@ -440,7 +440,7 @@ color_mode_from_string :: (value: string) -> ColorMode {
         case "builtin";               return .TRUE;
         case "auto";                  return .AUTO;
     }
-    print("jlsblk: unknown --color value '%' (use auto|never|ansi|true)\n", value);
+    print("%: unknown --color value '%' (use auto|never|ansi|true)\n", sprint("%warning%", hue_code(.YELLOW, .AUTO), RESET), value);
     return .AUTO;
 }
 
