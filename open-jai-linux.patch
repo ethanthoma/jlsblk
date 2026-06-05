@@ -322,7 +322,7 @@ index 6b17bdb..5466a27 100644
                  break :blk switch (ast.tag(value_node)) {
                      .var_decl => if (ast.data(value_node).rhs == using_param_sentinel)
 diff --git a/bootstrap/src/bytecode_gen.zig b/bootstrap/src/bytecode_gen.zig
-index 671267a..f761ceb 100644
+index 671267a..6212323 100644
 --- a/bootstrap/src/bytecode_gen.zig
 +++ b/bootstrap/src/bytecode_gen.zig
 @@ -1717,7 +1717,7 @@ const GenContext = struct {
@@ -482,8 +482,11 @@ index 671267a..f761ceb 100644
      fn removeBodyDeclState(ctx: *GenContext, node: NodeIndex) void {
          var visited: std.AutoHashMapUnmanaged(NodeIndex, void) = .empty;
          defer visited.deinit(ctx.program.allocator);
-@@ -6996,9 +7107,33 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+@@ -6994,11 +7105,36 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+                     for (children) |child_idx| {
+                         const child: NodeIndex = @intCast(child_idx);
                          const lhs = ast.data(child).lhs;
++                        if (assignTargetIsImmutableParam(ctx, lhs)) return diag.failAt(ast.tokens[ast.mainToken(lhs)].start, "Can't assign to an immutable argument.", .{});
                          const decl = ctx.resolved.local_values.get(lhs) orelse return diag.failAt(ast.tokens[ast.mainToken(lhs)].start, "assignment target must resolve to a local variable", .{});
                          try lhs_decls.append(ctx.program.allocator, decl);
 -                        try rhs_regs.append(ctx.program.allocator, try ctx.genExpr(ast.data(child).rhs, diag));
@@ -518,7 +521,15 @@ index 671267a..f761ceb 100644
                  } else {
                      for (ast.extraSlice(ast.data(stmt).lhs)) |child| try ctx.genStmt(@intCast(child), diag);
                  }
-@@ -7105,11 +7240,16 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+@@ -7006,6 +7142,7 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+             .assign_stmt => {
+                 const lhs = ast.data(stmt).lhs;
+                 const rhs_node = ast.data(stmt).rhs;
++                if (assignTargetIsImmutableParam(ctx, lhs)) return diag.failAt(ast.tokens[ast.mainToken(lhs)].start, "Can't assign to an immutable argument.", .{});
+                 if (try ctx.tryEmitGeneralMultiAssignment(lhs, rhs_node, stmt, diag)) return;
+                 if (try ctx.tryEmitAssignCompound(lhs, rhs_node, stmt, diag)) |_| return;
+                 if (try ctx.tryEmitSelfBinaryAssignment(lhs, rhs_node, stmt, diag)) |_| return;
+@@ -7105,11 +7242,16 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
                          try ctx.proc.instructions.append(ctx.program.allocator, .{ .opcode = .store_ptr_byte, .dest = addr, .arg1 = rhs, .source_node = stmt });
                      } else {
                          const target_elem_type = elem_text orelse "int";
@@ -540,7 +551,32 @@ index 671267a..f761ceb 100644
                      }
                      return;
                  }
-@@ -7256,6 +7396,27 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+@@ -7184,6 +7326,24 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+                                 return;
+                             }
+                         }
++                        // A register-backed struct local (`:=` init: no decl_addresses, owns its
++                        // storage via the copy path) reassigned from another struct value must copy
++                        // bytes into that storage and keep the same pointer. The scalar `load` path
++                        // below reassigns the pointer register, which needs a phi at branch merges
++                        // that the backend doesn't emit — breaking `fa := S; if c then fa = T;`.
++                        // Skip when decl_addresses is set (explicit decl: the address-store path
++                        // below is already correct and phi-safe) and when rhs is an aggregate literal
++                        // (needs emitAggregateToStruct, not a raw memcpy from a register).
++                        if (!ctx.decl_addresses.contains(decl) and ast.tag(rhs_node) != .aggregate_literal and ast.tag(rhs_node) != .typed_aggregate_literal) {
++                            if (decl_type) |dt| {
++                                const clean_struct = std.mem.trim(u8, dt, " \t\r\n");
++                                if (try typeTextIsEmbeddedStruct(ctx, clean_struct, diag)) {
++                                    const size_reg = try ctx.emitInt(stmt, @intCast(try typeTextSize(ctx, clean_struct, diag)));
++                                    try ctx.proc.instructions.append(ctx.program.allocator, .{ .opcode = .memcpy, .dest = old_reg, .arg1 = rhs, .arg2 = size_reg, .source_node = stmt });
++                                    return;
++                                }
++                            }
++                        }
+                         if (ctx.decl_addresses.get(decl)) |addr| {
+                             const type_text = decl_type orelse typeTextForExpr(ctx, lhs, diag) orelse "int";
+                             try emitStoreToAddressForType(ctx, addr, rhs, type_text, stmt, diag);
+@@ -7256,6 +7416,27 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
                          }
                      }
                      const reg = try ctx.genExpr(init, diag);
@@ -568,7 +604,33 @@ index 671267a..f761ceb 100644
                      const ty = if (ctx.typed) |typed| typed.typeOf(stmt) else Type.init(InternPool.well_known.any_type);
                      const init_ty = if (ctx.typed) |typed| typed.typeOf(init) else Type.init(InternPool.well_known.any_type);
                      if (ast.tag(stmt) == .var_decl) {
-@@ -11699,7 +11860,15 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+@@ -10228,6 +10409,25 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
+                     const then_supported = then_ty.isBool() or then_ty.isInteger() or then_ty.isFloat() or then_ty.isString();
+                     const else_supported = else_ty.isBool() or else_ty.isInteger() or else_ty.isFloat() or else_ty.isString();
+                     if (!then_supported or !else_supported) {
++                        // Struct arms are address-based: a scalar select_value would copy a
++                        // pointer (and the old code punted to the then-branch unconditionally).
++                        // Select the source address, then memcpy into a fresh slot so the
++                        // result owns its bytes.
++                        if (typeTextForExpr(ctx, @intCast(arms[0]), diag)) |then_text| {
++                            const clean = std.mem.trim(u8, then_text, " \t\r\n");
++                            if (try typeTextIsEmbeddedStruct(ctx, clean, diag)) {
++                                const size = try typeTextSize(ctx, clean, diag);
++                                const src = proc.num_registers;
++                                proc.num_registers += 1;
++                                try proc.instructions.append(program.allocator, .{ .opcode = .select_value, .dest = src, .arg1 = cond, .arg2 = then_reg, .arg3 = else_reg, .source_node = expr });
++                                const result = proc.num_registers;
++                                proc.num_registers += 1;
++                                try proc.instructions.append(program.allocator, .{ .opcode = .alloc_local_bytes, .dest = result, .arg1 = @intCast(@max(size, 1)), .source_node = expr });
++                                const size_reg = try ctx.emitInt(expr, @intCast(@max(size, 1)));
++                                try proc.instructions.append(program.allocator, .{ .opcode = .memcpy, .dest = result, .arg1 = src, .arg2 = size_reg, .source_node = expr });
++                                return result;
++                            }
++                        }
+                         return then_reg;
+                     }
+                 }
+@@ -11699,7 +11899,15 @@ fn canonicalProcedureTypeText(ctx: *GenContext, raw_type: []const u8) !?[]const
                          for (args[1..]) |item_idx| {
                              const item_node: NodeIndex = @intCast(item_idx);
                              const spread = ast.tag(item_node) == .unary_expr and ast.tokens[ast.mainToken(item_node)].tag == .dot_dot;
@@ -585,7 +647,7 @@ index 671267a..f761ceb 100644
                              if (spread) {
                                  const spread_src = ast.data(item_node).lhs;
                                  const spread_type = typeTextForExpr(ctx, spread_src, diag) orelse elem_ty;
-@@ -14355,6 +14524,16 @@ fn evalIntegerConstExpr(ctx: *GenContext, node: NodeIndex, diag: Diagnostic) !i6
+@@ -14355,6 +14563,16 @@ fn evalIntegerConstExpr(ctx: *GenContext, node: NodeIndex, diag: Diagnostic) !i6
                  if (ctx.polymorph_ints.get(base_name)) |v| {
                      if (std.mem.eql(u8, field_name, "value")) break :blk v;
                  }
@@ -602,7 +664,28 @@ index 671267a..f761ceb 100644
              }
              return diag.failAt(ast.tokens[ast.mainToken(node)].start, "unsupported field access in integer constant option", .{});
          },
-@@ -16291,6 +16470,20 @@ fn typeValuedIdentifierUseText(ctx: *GenContext, expr: NodeIndex) ?[]const u8 {
+@@ -15687,6 +15905,20 @@ fn typeTextForExpr(ctx: *GenContext, expr: NodeIndex, diag: Diagnostic) ?[]const
+         .char_literal => return "s64",
+         .integer_literal => return "int",
+         .float_literal => return "float32",
++        .ifx_expr => {
++            // Only report a type for same-struct-typed arms (so `x := ifx c then S1 else S2`
++            // infers the struct and field access works). Scalar/mixed arms keep their existing
++            // behavior — Sema merges them (e.g. bool+int -> s64), which this must not override.
++            const arms = ast.extraSlice(ast.data(expr).rhs);
++            if (arms.len == 2) {
++                const t0 = typeTextForExpr(ctx, @intCast(arms[0]), diag) orelse return null;
++                const t1 = typeTextForExpr(ctx, @intCast(arms[1]), diag) orelse return null;
++                const c0 = std.mem.trim(u8, t0, " \t\r\n");
++                const c1 = std.mem.trim(u8, t1, " \t\r\n");
++                if (std.mem.eql(u8, c0, c1) and (typeTextIsEmbeddedStruct(ctx, c0, diag) catch false)) return t0;
++            }
++            return null;
++        },
+         .array_type => return canonicalArrayTypeDisplay(ctx, ctx.nodeSource(expr), diag) catch ctx.nodeSource(expr),
+         .proc_type => return procTypeDisplayFromProcTypeNode(ctx, expr) catch ctx.nodeSource(expr),
+         .pointer_type => {
+@@ -16291,6 +16523,20 @@ fn typeValuedIdentifierUseText(ctx: *GenContext, expr: NodeIndex) ?[]const u8 {
      return null;
  }
  
@@ -623,7 +706,7 @@ index 671267a..f761ceb 100644
  fn typeArrayLiteralElementText(ctx: *GenContext, node: NodeIndex, index: usize) ?[]const u8 {
      const ast = ctx.ast;
      if (node == @import("Ast.zig").null_node or node >= ast.node_tags.items.len or ast.tag(node) != .typed_array_literal) return null;
-@@ -16968,6 +17161,20 @@ fn staticArrayCountFromText(ctx: *GenContext, raw: []const u8, diag: Diagnostic)
+@@ -16968,6 +17214,20 @@ fn staticArrayCountFromText(ctx: *GenContext, raw: []const u8, diag: Diagnostic)
      const count_text = std.mem.trim(u8, ty[1..close], " \t\r\n");
      if (count_text.len == 0) return null;
      if (std.fmt.parseInt(u64, count_text, 10)) |count| return count else |_| {}
@@ -644,7 +727,28 @@ index 671267a..f761ceb 100644
      if (evalIntegerTextExpr(ctx, count_text)) |count| {
          if (count >= 0) return @intCast(count);
      } else |_| {}
-@@ -20821,12 +21028,6 @@ fn emitFormattedPrint(ctx: *GenContext, fmt_node: NodeIndex, arg_nodes: []const
+@@ -17776,6 +18036,20 @@ fn procSignature(ast: *const Ast, proc: NodeIndex) ?ProcSig {
+     return .{ .params_extra = sig[0], .return_type = sig[1] };
+ }
+ 
++// Jai procedure arguments are immutable: `foo :: (x: int) { x = 1; }` is an error.
++// True when `lhs` is a plain identifier resolving to one of the current proc's parameters.
++fn assignTargetIsImmutableParam(ctx: *GenContext, lhs: NodeIndex) bool {
++    const ast = ctx.ast;
++    if (ast.tag(lhs) != .identifier) return false;
++    if (ctx.current_proc_node == @import("Ast.zig").null_node) return false;
++    const decl = ctx.resolved.local_values.get(lhs) orelse return false;
++    const sig = procSignature(ast, ctx.current_proc_node) orelse return false;
++    for (ast.extraSlice(sig.params_extra)) |param_idx| {
++        if (decl == @as(NodeIndex, @intCast(param_idx))) return true;
++    }
++    return false;
++}
++
+ fn procReturnTypeText(ast: *const Ast, sig: ProcSig) ?[]const u8 {
+     const ret_node = sig.return_type;
+     if (ret_node == @import("Ast.zig").null_node or ret_node >= ast.node_tags.items.len) return null;
+@@ -20821,12 +21095,6 @@ fn emitFormattedPrint(ctx: *GenContext, fmt_node: NodeIndex, arg_nodes: []const
              start = i + 1;
              continue;
          }
@@ -657,7 +761,7 @@ index 671267a..f761ceb 100644
          if (start < i) try emitLiteralPrint(program, proc, fmt[start..i], fmt_node);
          var selected_arg_index = arg_index;
          var next_start = i + 1;
-@@ -21724,6 +21925,8 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
+@@ -21724,6 +21992,8 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
      var saw_spread = false;
      var values = std.ArrayList(NodeIndex).empty;
      defer values.deinit(ctx.program.allocator);
@@ -666,7 +770,7 @@ index 671267a..f761ceb 100644
  
      for (raw_args) |arg_idx| {
          const arg: NodeIndex = @intCast(arg_idx);
-@@ -21752,14 +21955,10 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
+@@ -21752,14 +22022,10 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
                  const count = payload[2];
                  for (ast.extraSlice(extra)[0..count]) |item| try values.append(ctx.program.allocator, @intCast(item));
              } else {
@@ -685,7 +789,7 @@ index 671267a..f761ceb 100644
              }
              continue;
          }
-@@ -21780,6 +21979,11 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
+@@ -21780,6 +22046,11 @@ fn emitJoinAppend(ctx: *GenContext, builder_slot: Bytecode.Register, source_node
          const value = try ctx.genExpr(value_node, diag);
          try ctx.proc.instructions.append(ctx.program.allocator, .{ .opcode = .string_builder_append_string, .arg1 = builder_slot, .arg2 = value, .source_node = value_node });
      }
