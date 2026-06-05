@@ -77,6 +77,16 @@ get_mounts :: (majmin: string, all_mounts: [..]Mount) -> (points: [..]string) {
     return points;
 }
 
+udev_fstype :: (majmin: string) -> (fstype: string = "") {
+    text, ok := read_entire_file(sprint("/run/udev/data/b%", majmin));
+    if !ok then return "";
+    PREFIX :: "E:ID_FS_TYPE=";
+    for line : split(text, "\n") {
+        if begins_with(line, PREFIX) then return substr(line, PREFIX.count, line.count - PREFIX.count);
+    }
+    return "";
+}
+
 device_kind :: (sys_path: string) -> string {
     if file_exists(sprint("%/partition", sys_path)) then return "part";
     uuid, ok := read_trimmed(sprint("%/dm/uuid", sys_path));
@@ -93,6 +103,7 @@ Device :: struct {
     name:     string;
     size:     string;
     kind:     string;
+    fstype:   string;
     mounts:   [..]string;
     children: [..]Device;
 }
@@ -124,8 +135,9 @@ add_device :: (out: *[..]Device, sys_path: string, entry_name: string, all_mount
     size := byte_size_to_human_readable_size(byte_size);
     kind := device_kind(sys_path);
     majmin, _ := read_trimmed(sprint("%/dev", sys_path));
+    fstype := udev_fstype(majmin);
     mounts := get_mounts(majmin, all_mounts);
-    array_add(out, .{name, size, kind, mounts, children});
+    array_add(out, .{name, size, kind, fstype, mounts, children});
 }
 
 get_devices :: () -> (devices: [..]Device) {
@@ -338,6 +350,7 @@ Row :: struct {
     name:        string;
     size:        string;
     kind:        string;
+    fstype:      string;
     mounts:      string;
     avail:       string;
     usep:        string;
@@ -366,7 +379,7 @@ build_rows :: (device: *Device, prefix: string, is_root: bool, is_last: bool, ro
         avail_bytes = ab;
     }
 
-    array_add(rows, .{name, device.size, device.kind, mounts, avail, usep, avail_bytes, sprint("%%", prefix, connector), is_root});
+    array_add(rows, .{name, device.size, device.kind, device.fstype, mounts, avail, usep, avail_bytes, sprint("%%", prefix, connector), is_root});
 
     child_prefix := "";
 
@@ -384,7 +397,7 @@ build_rows :: (device: *Device, prefix: string, is_root: bool, is_last: bool, ro
 
 MIN_MOUNT_WIDTH :: 8;
 
-Field :: enum { NAME; SIZE; TYPE; AVAIL; USEP; MOUNT; }
+Field :: enum { NAME; SIZE; TYPE; FSTYPE; AVAIL; USEP; MOUNT; }
 Align :: enum { LEFT; RIGHT; }
 
 Column :: struct {
@@ -393,20 +406,22 @@ Column :: struct {
 }
 
 COLUMNS :: Column.[
-    .{.NAME,  .LEFT},
-    .{.SIZE,  .RIGHT},
-    .{.AVAIL, .RIGHT},
-    .{.USEP,  .RIGHT},
-    .{.TYPE,  .LEFT},
-    .{.MOUNT, .LEFT},
+    .{.NAME,   .LEFT},
+    .{.SIZE,   .RIGHT},
+    .{.AVAIL,  .RIGHT},
+    .{.USEP,   .RIGHT},
+    .{.TYPE,   .LEFT},
+    .{.FSTYPE, .LEFT},
+    .{.MOUNT,  .LEFT},
 ];
 
 cell :: (r: *Row, f: Field) -> string {
-    if f == .NAME  then return r.name;
-    if f == .SIZE  then return r.size;
-    if f == .TYPE  then return r.kind;
-    if f == .AVAIL then return r.avail;
-    if f == .USEP  then return r.usep;
+    if f == .NAME   then return r.name;
+    if f == .SIZE   then return r.size;
+    if f == .TYPE   then return r.kind;
+    if f == .FSTYPE then return r.fstype;
+    if f == .AVAIL  then return r.avail;
+    if f == .USEP   then return r.usep;
     return r.mounts;
 }
 
@@ -425,6 +440,7 @@ render_cell :: (r: *Row, col: Column, w: int, mode: ColorMode, header: bool) -> 
     padded := pad_right(text, w);
     if col.align == .RIGHT then padded = pad_left(text, w);
     if col.field == .TYPE  && !header then padded = dim(padded, mode);
+    if col.field == .FSTYPE  && !header then padded = dim(padded, mode);
     if col.field == .AVAIL && !header && text.count > 0 then padded = colorize_avail(padded, r.avail_bytes, mode);
     return padded;
 }
@@ -467,7 +483,7 @@ print_row :: (r: *Row, widths: [] int, frame: Frame, mode: ColorMode, header: bo
 
 render :: (devices: [..]Device, mode: ColorMode) {
     rows: [..]Row;
-    array_add(*rows, .{"NAME", "SIZE", "TYPE", "MOUNTPOINTS", "AVAIL", "USE%", 0, "", false});
+    array_add(*rows, .{"NAME", "SIZE", "TYPE", "FSTYPE", "MOUNTPOINTS", "AVAIL", "USE", 0, "", false});
 
     count := devices.count;
     if count > 0 {
