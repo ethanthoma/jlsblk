@@ -267,20 +267,20 @@ Statvfs :: struct {
 
 statvfs :: (path: *u8, buf: *Statvfs) -> s32 #foreign;
 
-disk_usage :: (mount: string) -> (avail: string = "", usep: string = "", avail_bytes: int = 0) {
+disk_usage :: (mount: string) -> (avail: string = "", pct: int = -1, avail_bytes: int = 0) {
     buf: Statvfs;
 
-    if statvfs(to_c_string(mount), *buf) != 0 then return "", "", 0;
-    if buf.f_blocks == 0 then return "", "", 0;
+    if statvfs(to_c_string(mount), *buf) != 0 then return "", -1, 0;
+    if buf.f_blocks == 0 then return "", -1, 0;
 
     used := buf.f_blocks - buf.f_bfree;
     denom := used + buf.f_bavail;
 
-    if denom <= 0 then return "", "", 0;
+    if denom <= 0 then return "", -1, 0;
 
     pct := (used * 100 + denom - 1) / denom;
     bytes := buf.f_bavail * buf.f_frsize;
-    return byte_size_to_human_readable_size(bytes), sprint("%\%", pct), bytes;
+    return byte_size_to_human_readable_size(bytes), pct, bytes;
 }
 
 RESET :: "\x1b[0m";
@@ -346,6 +346,27 @@ colorize_avail :: (s: string, bytes: int, mode: ColorMode) -> string {
     return sprint("%%%", color, s, RESET);
 }
 
+USAGE_BAR_WIDTH :: 10;
+
+usage_bar :: (pct: int) -> string {
+    filled := (pct * USAGE_BAR_WIDTH + 50) / 100;
+    if filled < 0 then filled = 0;
+    if filled > USAGE_BAR_WIDTH then filled = USAGE_BAR_WIDTH;
+    return sprint("%% %\%", repeat(filled, "█"), repeat(USAGE_BAR_WIDTH - filled, "░"), pct);
+}
+
+color_for_usage :: (pct: int, mode: ColorMode) -> string {
+    if pct >= 85 then return hue_code(.RED, mode);
+    if pct >= 60 then return hue_code(.YELLOW, mode);
+    return hue_code(.GREEN, mode);
+}
+
+colorize_usage :: (s: string, pct: int, mode: ColorMode) -> string {
+    color := color_for_usage(pct, mode);
+    if color.count == 0 then return s;
+    return sprint("%%%", color, s, RESET);
+}
+
 Row :: struct {
     name:        string;
     size:        string;
@@ -354,6 +375,7 @@ Row :: struct {
     mounts:      string;
     avail:       string;
     usep:        string;
+    usep_pct:    int;
     avail_bytes: int;
     prefix:      string;
     top:         bool;
@@ -370,16 +392,18 @@ build_rows :: (device: *Device, prefix: string, is_root: bool, is_last: bool, ro
 
     mounts      := join(.. device.mounts, separator = ", ");
     avail, usep := "", "";
+    usep_pct    := -1;
     avail_bytes := 0;
 
     if device.mounts.count > 0 {
-        a, u, ab := disk_usage(device.mounts[0]);
+        a, p, ab := disk_usage(device.mounts[0]);
         avail = a;
-        usep = u;
+        usep_pct = p;
         avail_bytes = ab;
+        if p >= 0 then usep = usage_bar(p);
     }
 
-    array_add(rows, .{name, device.size, device.kind, device.fstype, mounts, avail, usep, avail_bytes, sprint("%%", prefix, connector), is_root});
+    array_add(rows, .{name, device.size, device.kind, device.fstype, mounts, avail, usep, usep_pct, avail_bytes, sprint("%%", prefix, connector), is_root});
 
     child_prefix := "";
 
@@ -409,7 +433,7 @@ COLUMNS :: Column.[
     .{.NAME,   .LEFT},
     .{.SIZE,   .RIGHT},
     .{.AVAIL,  .RIGHT},
-    .{.USEP,   .RIGHT},
+    .{.USEP,   .LEFT},
     .{.TYPE,   .LEFT},
     .{.FSTYPE, .LEFT},
     .{.MOUNT,  .LEFT},
@@ -436,6 +460,12 @@ render_cell :: (r: *Row, col: Column, w: int, mode: ColorMode, header: bool) -> 
     if col.field == .NAME {
         gap := repeat(w - display_width(r.prefix) - display_width(text));
         return sprint("%%%", r.prefix, colorize(text, r.kind, mode), gap);
+    }
+    if col.field == .USEP && !header && r.usep_pct >= 0 {
+        sep := find_index_from_left(text, " ");
+        bar := substr(text, 0, sep);
+        rest := substr(text, sep, text.count - sep);
+        return sprint("%%%", colorize_usage(bar, r.usep_pct, mode), rest, repeat(w - display_width(text)));
     }
     padded := pad_right(text, w);
     if col.align == .RIGHT then padded = pad_left(text, w);
@@ -483,7 +513,7 @@ print_row :: (r: *Row, widths: [] int, frame: Frame, mode: ColorMode, header: bo
 
 render :: (devices: [..]Device, mode: ColorMode) {
     rows: [..]Row;
-    array_add(*rows, .{"NAME", "SIZE", "TYPE", "FSTYPE", "MOUNTPOINTS", "AVAIL", "USE", 0, "", false});
+    array_add(*rows, .{"NAME", "SIZE", "TYPE", "FSTYPE", "MOUNTPOINTS", "AVAIL", "USAGE", -1, 0, "", false});
 
     count := devices.count;
     if count > 0 {
