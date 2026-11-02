@@ -1,11 +1,11 @@
 # Jai List BLocK devices
 
+![jlsblk displaying block devices in a terminal](screenshot.png)
+
 > [!NOTE]
 >
 > This is (hopefully temp) developed with open-jai, and relies on vibe-coded
 > `open-jai-linux.patch` and build script in `flake.nix`
-
-![jlsblk displaying block devices in a terminal](screenshot.png)
 
 ## Run
 
