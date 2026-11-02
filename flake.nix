@@ -67,6 +67,7 @@
               runHook preBuild
               export HOME=$TMPDIR
               zig build --build-file bootstrap/build.zig \
+                -Dcpu=baseline \
                 -Dllvm-config="$LLVM_CONFIG" \
                 -Dcxx="$OPENJAI_CXX" \
                 --cache-dir "$TMPDIR/zig-cache" \

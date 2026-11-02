@@ -13,3 +13,6 @@
 
 # tmp while using open-jai
 !open-jai-linux.patch
+
+!LICENSE
+!screenshot.png
